@@ -146,3 +146,45 @@ async def websocket_telemetry_stream(websocket: WebSocket, session_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         telemetry_manager.disconnect(session_id, websocket)
+
+from pydantic import BaseModel
+from client import ScratchpadMiddleware
+
+scratchpad = ScratchpadMiddleware()
+
+class TurnInput(BaseModel):
+    session_id: str
+    messy_input: str
+
+class DrillDownInput(BaseModel):
+    session_id: str
+    edge_id: str
+
+@app.post("/v1/middleware/process")
+async def process_turn_endpoint(payload: TurnInput):
+    """Ingests messy input and returns a clean, token-bounded Markdown graph."""
+    try:
+        clean_context = await run_in_threadpool(scratchpad.process_turn, payload.session_id, payload.messy_input)
+        return {"session_id": payload.session_id, "scratchpad_view": clean_context}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/middleware/drill-down")
+async def drill_down_endpoint(payload: DrillDownInput):
+    """Exposes granular L1 details for an agent tracking specific macro structures."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT source_entity, relationship, target_entity, citation_quote 
+            FROM knowledge_graph 
+            WHERE session_id = ? AND parent_node_id = ?
+        """, (payload.session_id, payload.edge_id))
+        
+        details = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        return {"parent_node_id": payload.edge_id, "granular_history": details}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -4,3 +4,5 @@ pydantic==2.6.1
 httpx==0.26.0
 websockets==12.0
 transformers==4.37.2
+networkx==3.2.1
+python-louvain==0.16  # The standard Louvain community detection library

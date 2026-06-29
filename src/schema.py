@@ -23,3 +23,17 @@ class AgentUpdateRequest(BaseModel):
 class MemoryViewResponse(BaseModel):
     session_id: str
     markdown_view: str
+
+class GraphTripletSchema(BaseModel):
+    source_entity: str = Field(..., description="The canonical uppercase macro-entity.")
+    relationship: str = Field(..., description="The connecting verb or system dependency.")
+    target_entity: str = Field(..., description="The target uppercase macro-entity.")
+    citation_quote: str = Field(default="Generated via structural compression.", description="System generated reference.")
+
+class L2CompressionPayload(BaseModel):
+    reasoning_justification: str = Field(..., description="Chain-of-thought explaining the community synthesis.")
+    source_edge_ids_used: List[str] = Field(..., description="L1 edge_ids collapsed into this summary.")
+    extracted_l2_triplets: List[GraphTripletSchema] = Field(..., description="The macro triplets.")
+
+class L1ExtractionPayload(BaseModel):
+    triplets: List[GraphTriplet]

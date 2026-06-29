@@ -30,17 +30,27 @@ def initialize_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS knowledge_graph (
             edge_id TEXT PRIMARY KEY,
-            session_id TEXT,
+            session_id TEXT NOT NULL,
             agent_id TEXT,
             source_entity TEXT NOT NULL,
             relationship TEXT NOT NULL,
             target_entity TEXT NOT NULL,
-            citation_quote TEXT NOT NULL,
+            citation_quote TEXT,
+            hierarchy_level INTEGER DEFAULT 1,
+            parent_node_id TEXT DEFAULT NULL,
+            relevance_score REAL DEFAULT 1.0,
+            is_active BOOLEAN DEFAULT 1,
             extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(session_id) REFERENCES sessions(session_id),
             UNIQUE(session_id, source_entity, relationship, target_entity) 
             ON CONFLICT REPLACE
         )
+    """)
+    
+    # Add composite index for fast SYNC paths
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_active_session_relevance 
+        ON knowledge_graph (session_id, is_active, relevance_score DESC)
     """)
     
     # 3. Unresolved Variables Matrix

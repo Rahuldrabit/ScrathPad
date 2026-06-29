@@ -1,6 +1,23 @@
 import uuid
 from database import get_db_connection
 from schema import PageExtractionPayload
+from rapidfuzz import fuzz
+
+def canonicalize_entity(cursor, session_id: str, incoming_entity: str, threshold=85) -> str:
+    """Collapses synonyms to prevent graph fragmentation."""
+    cursor.execute(
+        "SELECT DISTINCT source_entity FROM knowledge_graph WHERE session_id = ? AND is_active = TRUE", 
+        (session_id,)
+    )
+    existing_entities = [row[0] for row in cursor.fetchall()]
+    
+    normalized_incoming = incoming_entity.strip().upper()
+    
+    for existing in existing_entities:
+        if fuzz.token_ratio(normalized_incoming, existing) >= threshold:
+            return existing
+            
+    return normalized_incoming
 
 def verify_citation(raw_chunk: str, citation: str) -> bool:
     """Anti-hallucination guardrail. Ensures exact matches only."""
@@ -25,13 +42,16 @@ async def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: 
                 print(f"[GUARDRAIL] Rejected hallucinated triplet: {triplet.source_entity} -> {triplet.target_entity}")
                 continue 
                 
+            src = canonicalize_entity(cursor, session_id, triplet.source_entity)
+            tgt = canonicalize_entity(cursor, session_id, triplet.target_entity)
+                
             edge_id = str(uuid.uuid4())
             cursor.execute("""
                 INSERT OR REPLACE INTO knowledge_graph 
-                (edge_id, session_id, agent_id, source_entity, relationship, target_entity, citation_quote)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (edge_id, session_id, agent_id, triplet.source_entity.upper().strip(), 
-                  triplet.relationship.lower().strip(), triplet.target_entity.upper().strip(), 
+                (edge_id, session_id, agent_id, source_entity, relationship, target_entity, citation_quote, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)
+            """, (edge_id, session_id, agent_id, src, 
+                  triplet.relationship.lower().strip(), tgt, 
                   triplet.citation_quote.strip()))
             
             verified_count += 1
