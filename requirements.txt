@@ -6,3 +6,15 @@ websockets==12.0
 transformers==4.37.2
 networkx==3.2.1
 python-louvain==0.16  # The standard Louvain community detection library
+rapidfuzz==3.14.5     # Entity canonicalization (engine.py imports this at module level -
+                       # app fails to boot without it)
+ollama==0.6.2          # Default SCRATCHPAD_LLM_BACKEND; first inference call fails without it
+tiktoken==0.13.0       # Optional: more accurate token counts when available. Its
+                       # cl100k_base encoding fetches a ranks file from a network
+                       # URL on first use (not bundled in the wheel); engine.py
+                       # falls back to a character heuristic automatically if
+                       # that fetch fails or the box has no network access.
+
+# Only needed if SCRATCHPAD_LLM_BACKEND=transformers:
+# instructor
+# torch

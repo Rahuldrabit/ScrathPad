@@ -1,0 +1,26 @@
+# SQLite databases - these are runtime state, not source. scratchpad_memory.db
+# was previously committed to the repo with actual written pages in it (local
+# test/dev state tracked in git history). Untrack it with:
+#   git rm --cached scratchpad_memory.db
+#   git rm --cached src/scratchpad_memory.db   # if present there too
+# then commit this .gitignore.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Local scratch / editor
+.DS_Store
+.vscode/
+.idea/
+
+README.md

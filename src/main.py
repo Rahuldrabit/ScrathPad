@@ -2,14 +2,28 @@ import json
 import asyncio
 from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel
 from typing import Dict, List
 
 # Core internal system imports
 from database import initialize_database, get_db_connection
 from schema import AgentUpdateRequest, MemoryViewResponse, PageExtractionPayload, SessionInitRequest
-from engine import commit_page_data_to_sqlite, compile_graph_memory_to_markdown
+from engine import commit_page_data_to_sqlite, compile_bounded_markdown_view
+from telemetry import telemetry_manager
+from client import ScratchpadMiddleware
 
 app = FastAPI(title="Scratchpad Context Middleware", version="2.0.0")
+scratchpad = ScratchpadMiddleware()
+
+
+class TurnInput(BaseModel):
+    session_id: str
+    messy_input: str
+
+
+class DrillDownInput(BaseModel):
+    session_id: str
+    edge_id: str
 
 class LocalTelemetryManager:
     def __init__(self):
@@ -40,6 +54,13 @@ class LocalTelemetryManager:
 # Instantiate the global real-time event dispatcher
 telemetry_manager = LocalTelemetryManager()
 
+# NOTE: the LocalTelemetryManager class used to be defined again, identically,
+# right here. telemetry.py already defines and instantiates it, but nothing
+# imported that module - main.py just kept its own separate copy, and any
+# fix made to one would silently not apply to the other. telemetry.py's
+# version is also slightly safer (it guards disconnect() against removing a
+# websocket that isn't in the list), so that's the one that now gets used.
+
 @app.on_event("startup")
 async def startup_event():
     initialize_database()
@@ -55,9 +76,9 @@ async def initialize_session(payload: SessionInitRequest):
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO sessions (session_id, master_plan, global_status)
-            VALUES (?, ?, 'EXECUTING')
-        """, (payload.session_id, payload.master_plan))
+            INSERT OR REPLACE INTO sessions (session_id, user_query, master_plan, global_status)
+            VALUES (?, ?, ?, 'EXECUTING')
+        """, (payload.session_id, payload.user_query, payload.master_plan))
         conn.commit()
         return {"status": "INITIALIZED", "session_id": payload.session_id}
     except Exception as e:
@@ -67,14 +88,14 @@ async def initialize_session(payload: SessionInitRequest):
         conn.close()
 
 @app.get("/v1/session/{session_id}/memory", response_model=MemoryViewResponse)
-async def get_session_memory_view(session_id: str):
+async def get_session_memory_view(session_id: str, max_tokens: int = 6000):
     """
     Compiles the relational data matrix out of SQLite directly into
-    a GitHub-Flavored Markdown text layer for the agents to read.
+    a token-bounded GitHub-Flavored Markdown text layer for agents to read.
     """
     try:
         # DB reads are fast, but running inside threadpool keeps event loop pristine
-        markdown_text = await run_in_threadpool(compile_graph_memory_to_markdown, session_id)
+        markdown_text = await run_in_threadpool(compile_bounded_markdown_view, session_id, max_tokens)
         return MemoryViewResponse(session_id=session_id, markdown_view=markdown_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -146,19 +167,6 @@ async def websocket_telemetry_stream(websocket: WebSocket, session_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         telemetry_manager.disconnect(session_id, websocket)
-
-from pydantic import BaseModel
-from client import ScratchpadMiddleware
-
-scratchpad = ScratchpadMiddleware()
-
-class TurnInput(BaseModel):
-    session_id: str
-    messy_input: str
-
-class DrillDownInput(BaseModel):
-    session_id: str
-    edge_id: str
 
 @app.post("/v1/middleware/process")
 async def process_turn_endpoint(payload: TurnInput):

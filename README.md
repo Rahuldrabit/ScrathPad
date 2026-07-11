@@ -228,7 +228,7 @@ python src/database.py
 cp .env.example .env
 # Edit .env: set SCRATCHPAD_LLM_BACKEND and SCRATCHPAD_MODEL_NAME
 
-# 4. Start the middleware server
+# 4. Start the src server
 uvicorn src.main:app --reload --port 8000
 ```
 

@@ -1,6 +1,11 @@
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 
+class SessionInitRequest(BaseModel):
+    session_id: str
+    master_plan: Optional[str] = None
+    user_query: Optional[str] = None
+
 class GraphTriplet(BaseModel):
     source_entity: str = Field(..., description="Subject noun, class, or env var in uppercase.")
     relationship: str = Field(..., description="Active verb indicating connection (lowercase_with_underscores).")

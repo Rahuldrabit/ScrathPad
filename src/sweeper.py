@@ -56,13 +56,28 @@ class GraphSweeperDaemon:
             if not edges:
                 return
                 
-            # Group edges by session to prevent cross-session clustering
+            # Group edges by session to prevent cross-session clustering.
+            #
+            # BUGFIX: a plain nx.Graph() only holds one edge between any pair
+            # of nodes. If two different relationship types exist between the
+            # same source/target (e.g. "A -calls-> B" and "A -depends_on-> B",
+            # both legal distinct DB rows), the second add_edge() call used to
+            # silently overwrite the first edge's edge_id attribute. That
+            # first triplet then vanished from compression bookkeeping - it
+            # stayed is_active=TRUE forever and was never eligible for a
+            # community. We keep a plain (non-multi) Graph, since that is
+            # what Louvain expects, but accumulate a list of edge_ids per
+            # node pair instead of a single scalar.
             session_graphs = {}
             for edge in edges:
                 sid = edge['session_id']
                 if sid not in session_graphs:
                     session_graphs[sid] = nx.Graph()
-                session_graphs[sid].add_edge(edge['source_entity'], edge['target_entity'], edge_id=edge['edge_id'])
+                G = session_graphs[sid]
+                if G.has_edge(edge['source_entity'], edge['target_entity']):
+                    G[edge['source_entity']][edge['target_entity']]['edge_ids'].append(edge['edge_id'])
+                else:
+                    G.add_edge(edge['source_entity'], edge['target_entity'], edge_ids=[edge['edge_id']])
                 
             for session_id, G in session_graphs.items():
                 # Check if any node in this session exceeds degree threshold
@@ -79,10 +94,10 @@ class GraphSweeperDaemon:
                 communities = {}
                 for u, v, data in G.edges(data=True):
                     c_u, c_v = partition[u], partition[v]
-                    if c_u == c_v: 
+                    if c_u == c_v:
                         if c_u not in communities:
                             communities[c_u] = []
-                        communities[c_u].append(data['edge_id'])
+                        communities[c_u].extend(data['edge_ids'])
                         
                 # Compress
                 for community_id, edge_ids in communities.items():
@@ -95,12 +110,57 @@ class GraphSweeperDaemon:
                         
                         try:
                             l2_payload = self.compress_louvain_community(community_id, edge_ids, raw_triplets)
-                            
+
+                            # --- L2 Verification Gate ---
+                            # L1 triplets are trusted only after their citation_quote is
+                            # checked against raw text. L2 triplets have no raw text to
+                            # check against, so we ground them against the source
+                            # community instead: (a) the SLM must not reference edge_ids
+                            # outside the community it was actually given, and (b) every
+                            # proposed summary triplet must mention at least one entity
+                            # that was actually present in the source community. Without
+                            # this, nothing stops the SLM from inventing an entity that
+                            # was never in the cluster it was asked to summarize.
+                            valid_edge_id_set = set(edge_ids)
+                            if not set(l2_payload.source_edge_ids_used).issubset(valid_edge_id_set):
+                                print(
+                                    f"[SWEEPER][GUARDRAIL] Rejected L2 compression for "
+                                    f"community {community_id}: referenced edge_ids outside "
+                                    f"the source community. L1 rows left uncompressed."
+                                )
+                                continue
+
+                            grounded_entities = set()
+                            for t in raw_triplets:
+                                grounded_entities.add(t['source_entity'])
+                                grounded_entities.add(t['target_entity'])
+
+                            filtered_l2_triplets = [
+                                t for t in l2_payload.extracted_l2_triplets
+                                if t.source_entity in grounded_entities
+                                or t.target_entity in grounded_entities
+                            ]
+
+                            if not filtered_l2_triplets:
+                                print(
+                                    f"[SWEEPER][GUARDRAIL] Rejected L2 compression for "
+                                    f"community {community_id}: no proposed summary triplet "
+                                    f"was grounded in the source community's entities."
+                                )
+                                continue
+
+                            dropped = len(l2_payload.extracted_l2_triplets) - len(filtered_l2_triplets)
+                            if dropped > 0:
+                                print(
+                                    f"[SWEEPER][GUARDRAIL] Dropped {dropped} ungrounded "
+                                    f"summary triplet(s) from community {community_id}."
+                                )
+
                             cursor.execute("BEGIN TRANSACTION;")
                             
                             first_l2_id = None
                             
-                            for i, t in enumerate(l2_payload.extracted_l2_triplets):
+                            for i, t in enumerate(filtered_l2_triplets):
                                 l2_id = str(uuid.uuid4())
                                 if i == 0:
                                     first_l2_id = l2_id
