@@ -113,6 +113,26 @@ Two new endpoints exposed for any non-Python client (Node.js, Go, curl, etc.):
 | `POST` | `/v1/middleware/process` | Ingest messy input → return clean scratchpad |
 | `POST` | `/v1/middleware/drill-down` | Expand a compressed L2 node back to its L1 history |
 
+### ✅ Deterministic Hallucination Guardrails (`src/engine.py`, `src/schema.py`)
+The verification gate is a multi-layer deterministic pipeline — no LLM judgement involved in the reject/commit decision. Every rejection is logged to `rejected_triplets` for later analysis, and (when a dashboard is attached) broadcast live over the telemetry WebSocket.
+
+| Layer | Check | Rejection Reason |
+|---|---|---|
+| 1 | In-schema chain-of-thought (`direction_check` must match the fields) | `direction_check_mismatch` |
+| 2 | Closed relationship vocabulary (`ALLOWED_RELATIONSHIPS`) | `bad_relationship_vocab` |
+| 2b | Per-`EntityType` shape regex (entity string matches its declared type) | `bad_source_entity_shape` / `bad_target_entity_shape` |
+| 3 | Citation is an exact substring of the raw chunk | `citation_mismatch` |
+| 4 | Citation quality score (length / uniqueness / triviality) | `low_citation_score` |
+| 5 | Atomicity — no compound conjunctions in the citation | `compound_fact` |
+| 6 | Functional-relationship contradiction (one port / IP / region per source) | `contradicts existing: ...` |
+| 8 | Pinned facts — YAML-configured immutable constants | `contradicts_pinned_fact` |
+
+**Pinned Facts (Layer 8)** lets you declare ground-truth constants in `src/pinned_facts.yaml` that extractions can never contradict. An extraction that *agrees* with a pinned fact passes; one that proposes a different target for the same `(source, relationship)` is rejected.
+
+**L2 Type Inheritance:** the sweeper overrides the LLM's `source_type` / `target_type` on L2 summary nodes with the majority type from the source L1 community — so a compressed cluster of `[SERVICE] → [DATABASE]` edges can never be mislabelled `[TABLE] → [QUEUE]` by the model.
+
+**Rejection Telemetry:** every rejection fires a `guardrail_rejection` event over the WebSocket stream, so an operator dashboard can surface "60% of extractions are failing `low_citation_score` right now" without querying SQLite.
+
 ---
 
 ## 3. The Data Schema & Memory Model
@@ -128,17 +148,25 @@ The architecture abandons flat file persistence in favour of a hierarchical, ato
 **Key `knowledge_graph` columns:**
 
 ```sql
-edge_id          TEXT PRIMARY KEY
-session_id       TEXT NOT NULL
-source_entity    TEXT NOT NULL      -- Canonicalized UPPERCASE
-relationship     TEXT NOT NULL      -- lowercase_with_underscores
-target_entity    TEXT NOT NULL      -- Canonicalized UPPERCASE
-citation_quote   TEXT               -- Exact substring from raw text (L1 only)
-hierarchy_level  INTEGER DEFAULT 1  -- 1=raw, 2=compressed
-parent_node_id   TEXT DEFAULT NULL  -- Points to L2 parent edge_id
-relevance_score  REAL DEFAULT 1.0   -- Centrality/decay score
-is_active        BOOLEAN DEFAULT 1  -- FALSE when compressed
+edge_id            TEXT PRIMARY KEY
+session_id         TEXT NOT NULL
+source_entity      TEXT NOT NULL      -- Canonicalized UPPERCASE
+relationship       TEXT NOT NULL      -- lowercase_with_underscores
+target_entity      TEXT NOT NULL      -- Canonicalized UPPERCASE
+citation_quote     TEXT               -- Exact substring from raw text (L1 only)
+hierarchy_level    INTEGER DEFAULT 1  -- 1=raw, 2=compressed
+parent_node_id     TEXT DEFAULT NULL  -- Points to L2 parent edge_id
+relevance_score    REAL DEFAULT 1.0   -- Centrality/decay score
+is_active          BOOLEAN DEFAULT 1  -- FALSE when compressed
+-- Provenance columns (added by migration):
+source_type        TEXT DEFAULT 'UNKNOWN'  -- EntityType (SERVICE, FILE, TABLE, …)
+target_type        TEXT DEFAULT 'UNKNOWN'
+extractor          TEXT DEFAULT 'unknown'  -- middleware | agent | sweeper_l2 | observation | plan
+pass_number        INTEGER DEFAULT 0       -- 0 for single-pass, 1..N for consensus
+raw_citation_score REAL DEFAULT 0.0        -- Layer 4 score at commit time
 ```
+
+The `extractor` column answers "where did this fact come from?" — middleware auto-extraction, an agent's structured update, the L2 sweeper, a `record_observation` call, or an initial plan. The migration is idempotent and runs automatically on every `initialize_database()`.
 
 ---
 
@@ -158,8 +186,8 @@ is_active        BOOLEAN DEFAULT 1  -- FALSE when compressed
 ### Phase 3: COMMIT (Verification & Storage)
 1. The Agent SDK sends extracted triplets + raw text to `POST /v1/agent/update`.
 2. The `canonicalize_entity` disambiguation gate collapses synonym entities.
-3. The citation verification gate checks each `citation_quote` exists as an exact substring.
-4. Verified triplets are written atomically to SQLite. Hallucinated ones are rejected.
+3. Each triplet runs through the deterministic verification pipeline (Layers 1–6 + 8): direction consistency, vocabulary, entity-shape regex, citation substring, citation quality, atomicity, functional-relationship contradiction, and pinned-fact contradiction.
+4. Verified triplets are written atomically to SQLite with provenance (`extractor`, `pass_number`, `raw_citation_score`). Rejected triplets are logged to `rejected_triplets` and broadcast as `guardrail_rejection` telemetry events.
 5. If all triplets are rejected, an HTTP 422 is returned and the agent retries.
 
 ---
@@ -192,6 +220,16 @@ SCRATCHPAD_MODEL_NAME=qwen2.5:14b    # Model identifier for the selected backend
 LLAMACPP_API_URL=http://localhost:8080/completion  # Only needed for llamacpp
 ```
 
+**Pinned Facts (optional):** declare immutable ground-truth constants in `src/pinned_facts.yaml`. Any extraction that contradicts a pinned fact (same `(source, relationship)` but a different `target`) is rejected. The file is lazy-loaded once at startup and cached; call `engine.reload_pinned_facts()` to pick up edits without a restart. The shipped file is empty (commented examples only) — the layer is a no-op until you populate it.
+
+```yaml
+# src/pinned_facts.yaml
+facts:
+  - source_entity: POSTGRES_PRIMARY
+    relationship: runs_on_port
+    target_entity: PORT_5432
+```
+
 ---
 
 ## 7. Project Structure
@@ -200,16 +238,21 @@ LLAMACPP_API_URL=http://localhost:8080/completion  # Only needed for llamacpp
 middleware/
 ├── src/
 │   ├── database.py       # SQLite WAL init, schema, connection management
-│   ├── schema.py         # Pydantic models (GraphTriplet, L1/L2 payloads)
+│   ├── schema.py         # Pydantic models (GraphTriplet, L1/L2 payloads, ENTITY_PATTERNS)
 │   ├── inference.py      # UniversalInferenceEngine (Ollama/Llama.cpp/Transformers)
-│   ├── engine.py         # Disambiguation, citation verification, commit pipeline
+│   ├── engine.py         # Disambiguation, guardrail pipeline, pinned facts, commit
 │   ├── sweeper.py        # GraphSweeperDaemon — background Louvain compressor
 │   ├── client.py         # ScratchpadMiddleware — universal Python SDK wrapper
 │   ├── main.py           # FastAPI app with all REST + WebSocket endpoints
 │   ├── agent_sdk.py      # Async HTTP client helper for agent integrations
-│   └── telemetry.py      # WebSocket telemetry stream manager
+│   ├── scratchpad_agent.py # ScratchpadPoweredLLM — drop-in LLM wrapper
+│   ├── telemetry.py      # WebSocket telemetry stream manager
+│   └── pinned_facts.yaml # Layer 8 immutable constants (edit for your deployment)
+├── tests/
+│   ├── test_verification_layers.py   # Unit tests for the guardrail pipeline (no LLM)
+│   ├── test_regressions.py           # Regression tests for execution-time bugs
+│   └── test_l2_type_inheritance.py   # L2 majority-type override tests
 ├── requirements.txt
-├── test_listener.py      # WebSocket telemetry listener for local testing
 └── README.md
 ```
 
@@ -257,3 +300,8 @@ uvicorn src.main:app --reload --port 8000
 | Mid-execution crash | All state in SQLite; agents resume from last committed triplet |
 | Overlapping sweeper runs | `asyncio.Lock()` prevents concurrent Louvain executions |
 | LLM backend failure | `UniversalInferenceEngine` raises typed exceptions for clean retry |
+| Fabricated citations | Layer 3 exact-substring check + Layer 4 quality score |
+| Entity mislabelled with wrong type | Layer 2b per-`EntityType` shape regex |
+| LLM contradicts a known constant | Layer 8 pinned-facts check (YAML-configured) |
+| L2 summary mislabelled vs its community | L2 type inheritance (majority type override) |
+| Silent rejection with no visibility | Rejection log + live WebSocket telemetry broadcast |

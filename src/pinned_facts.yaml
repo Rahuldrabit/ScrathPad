@@ -1,0 +1,23 @@
+# Pinned Facts — immutable constants that LLM extractions can never overwrite.
+#
+# If a new extraction proposes a triplet that contradicts a pinned fact
+# (same source + relationship but different target), the extraction is
+# rejected with reason "contradicts_pinned_fact".
+#
+# An extraction that MATCHES a pinned fact (same source, relationship, AND
+# target) is allowed through — the pinned fact is already true, and the LLM
+# agreeing with it is not a contradiction.
+#
+# To add new pinned facts, add entries under the `facts:` key below.
+# The system lazy-loads this file once at process startup and caches it.
+
+# facts:
+#   - source_entity: POSTGRES_PRIMARY
+#     relationship: runs_on_port
+#     target_entity: PORT_5432
+#   - source_entity: AUTH_SERVICE
+#     relationship: hosted_in_region
+#     target_entity: REGION_US_EAST_1
+#   - source_entity: USER_DATA_TABLE
+#     relationship: encrypted_at_rest
+#     target_entity: TRUE

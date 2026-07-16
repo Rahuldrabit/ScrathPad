@@ -1,4 +1,7 @@
 import uuid
+import asyncio
+import yaml
+from pathlib import Path
 from database import get_db_connection
 from schema import (
     PageExtractionPayload,
@@ -6,8 +9,10 @@ from schema import (
     FUNCTIONAL_RELATIONSHIPS,
     validate_relationship,
     validate_direction,
+    validate_entity_shape,
 )
 from rapidfuzz import fuzz, process as rf_process
+from telemetry import telemetry_manager
 
 # --- Token counting: real tokenizer when available, heuristic fallback ---
 #
@@ -186,6 +191,70 @@ def check_contradiction(cursor, session_id: str, source_entity: str,
     return False, ""
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Layer 8: Pinned facts (YAML-configured immutable constants)
+#
+# Some facts are known constants and must never be overwritten by LLM
+# extractions, even if the LLM contradicts them (e.g. POSTGRES_PRIMARY
+# runs_on_port 5432). If a pinned fact exists for the same (source,
+# relationship) pair but with a DIFFERENT target, the new triplet is a
+# contradiction against ground truth and is rejected.
+#
+# Lazy-loaded from pinned_facts.yaml next to this module; cached for the
+# process lifetime. If the file is absent or empty, the layer is a no-op.
+# ─────────────────────────────────────────────────────────────────────────
+_PINNED_FACTS: list = []
+_PINNED_FACTS_LOADED = False
+
+
+def _load_pinned_facts():
+    """Lazy-load pinned facts from pinned_facts.yaml. Cached for process lifetime."""
+    global _PINNED_FACTS, _PINNED_FACTS_LOADED
+    if _PINNED_FACTS_LOADED:
+        return
+    path = Path(__file__).parent / "pinned_facts.yaml"
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            _PINNED_FACTS = data.get("facts", []) or []
+        except Exception as e:
+            print(f"[GUARDRAIL] Failed to load pinned_facts.yaml ({e}); treating as empty.")
+            _PINNED_FACTS = []
+    _PINNED_FACTS_LOADED = True
+
+
+def reload_pinned_facts():
+    """
+    Force a reload of pinned_facts.yaml on the next check. Exposed so tests
+    can swap in a temp YAML and so operators can pick up edits without a
+    full process restart.
+    """
+    global _PINNED_FACTS_LOADED
+    _PINNED_FACTS_LOADED = False
+
+
+def check_pinned_contradiction(source: str, relationship: str, target: str) -> bool:
+    """
+    Returns True if (source, relationship, target) contradicts any pinned
+    fact. 'Contradicts' means: a pinned fact exists with the same
+    (source, relationship) but a DIFFERENT target. A matching target is
+    NOT a contradiction — the LLM agreeing with ground truth is fine.
+    """
+    _load_pinned_facts()
+    rel = (relationship or "").lower().strip()
+    src = (source or "").strip().upper()
+    tgt = (target or "").strip().upper()
+    for p in _PINNED_FACTS:
+        if (
+            str(p.get("source_entity", "")).upper() == src
+            and str(p.get("relationship", "")).lower() == rel
+        ):
+            if str(p.get("target_entity", "")).upper() != tgt:
+                return True
+    return False
+
+
 # Rejection log table — keep one row per rejected triplet so we can
 # analyze failure modes and tighten the filters over time.
 REJECTION_TABLE = """
@@ -200,7 +269,7 @@ REJECTION_TABLE = """
 """
 
 
-def _log_rejection(cursor, session_id, triplet, reason, raw_chunk):
+def _log_rejection(cursor, session_id, triplet, reason, raw_chunk, score=None):
     """Persist a rejected triplet for later analysis."""
     cursor.execute(
         """
@@ -210,9 +279,40 @@ def _log_rejection(cursor, session_id, triplet, reason, raw_chunk):
         """,
         (session_id, triplet.model_dump_json(), reason, (raw_chunk or "")[:4000]),
     )
+    # Broadcast a live telemetry event for operators watching the dashboard.
+    # engine.py runs synchronous sqlite I/O (called via run_in_threadpool in
+    # the FastAPI path), so we may or may not be inside a running event loop.
+    # Schedule the broadcast when there is one; skip silently otherwise (e.g.
+    # during unit tests or in-process agent mode). A failed broadcast must
+    # never break the commit transaction.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(telemetry_manager.broadcast(session_id, {
+            "event": "guardrail_rejection",
+            "telemetry": {
+                "active_agent": getattr(triplet, "source_entity", None),
+                "rejection_reason": reason,
+            },
+            "rejection_details": {
+                "proposed_source": getattr(triplet, "source_entity", None),
+                "proposed_relationship": getattr(triplet, "relationship", None),
+                "proposed_target": getattr(triplet, "target_entity", None),
+                "citation_score": score,
+            },
+        }))
+    except RuntimeError:
+        # No running event loop — e.g. unit tests or in-process agent mode.
+        pass
 
 
-def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, extraction_data: PageExtractionPayload) -> int:
+def commit_page_data_to_sqlite(
+    session_id: str,
+    agent_id: str,
+    raw_chunk: str,
+    extraction_data: PageExtractionPayload,
+    extractor: str = "agent",
+    pass_number: int = 0,
+) -> int:
     """
     Runs the deterministic verification engine and bulk upserts verified facts.
 
@@ -252,6 +352,10 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
 
         for triplet in extraction_data.extracted_triplets:
             reason = None
+            # Compute the score once. Used by Layer 4 and persisted on
+            # commit so we can later answer "this row is on the edge
+            # of being rejected — what happened?"
+            score = citation_score(triplet.citation_quote, raw_chunk)
 
             # Layer 1: in-schema CoT — model said who-acts-on-whom,
             # now verify what it filled in matches.
@@ -262,12 +366,21 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
             elif not validate_relationship(triplet.relationship):
                 reason = "bad_relationship_vocab"
 
+            # Layer 2b: per-EntityType shape validation
+            # Cheap regex gate: the entity string must look like its
+            # declared type. Catches obvious garbage like a raw SQL
+            # fragment labeled as a SERVICE.
+            elif not validate_entity_shape(triplet.source_entity, triplet.source_type):
+                reason = "bad_source_entity_shape"
+            elif not validate_entity_shape(triplet.target_entity, triplet.target_type):
+                reason = "bad_target_entity_shape"
+
             # Layer 3: citation substring match (existing)
             elif not verify_citation(raw_chunk, triplet.citation_quote):
                 reason = "citation_mismatch"
 
             # Layer 4: citation quality score
-            elif citation_score(triplet.citation_quote, raw_chunk) < CITATION_SCORE_THRESHOLD:
+            elif score < CITATION_SCORE_THRESHOLD:
                 reason = "low_citation_score"
 
             # Layer 5: atomicity — no compound conjunctions
@@ -275,7 +388,7 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
                 reason = "compound_fact"
 
             if reason is not None:
-                _log_rejection(cursor, session_id, triplet, reason, raw_chunk)
+                _log_rejection(cursor, session_id, triplet, reason, raw_chunk, score=score)
                 print(f"[GUARDRAIL] Rejected: {triplet.source_entity} -> {triplet.target_entity} | {reason}")
                 continue
 
@@ -287,7 +400,19 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
                 cursor, session_id, src, triplet.relationship, tgt
             )
             if contradicts:
-                _log_rejection(cursor, session_id, triplet, why, raw_chunk)
+                _log_rejection(cursor, session_id, triplet, why, raw_chunk, score=score)
+                print(f"[GUARDRAIL] Rejected: {why}")
+                continue
+
+            # Layer 8: pinned fact contradiction (YAML-configured constants)
+            if check_pinned_contradiction(src, triplet.relationship, tgt):
+                why = (
+                    f"contradicts pinned fact: {src} {triplet.relationship} -> {tgt}"
+                )
+                _log_rejection(
+                    cursor, session_id, triplet, "contradicts_pinned_fact",
+                    raw_chunk, score=score,
+                )
                 print(f"[GUARDRAIL] Rejected: {why}")
                 continue
 
@@ -295,13 +420,15 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
             cursor.execute("""
                 INSERT OR REPLACE INTO knowledge_graph
                 (edge_id, session_id, agent_id, source_entity, source_type,
-                 relationship, target_entity, target_type, citation_quote, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                 relationship, target_entity, target_type, citation_quote,
+                 is_active, extractor, pass_number, raw_citation_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?)
             """, (edge_id, session_id, agent_id, src,
                   triplet.source_type,
                   triplet.relationship.lower().strip(), tgt,
                   triplet.target_type,
-                  triplet.citation_quote.strip()))
+                  triplet.citation_quote.strip(),
+                  extractor, pass_number, score))
 
             verified_count += 1
 

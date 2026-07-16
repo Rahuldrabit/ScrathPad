@@ -28,6 +28,51 @@ EntityType = Literal[
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Per-EntityType regex allowlist
+#
+# The EntityType literal only checks that source_type/target_type is one of
+# the allowed strings. It does NOT check that the entity string itself
+# looks like its declared type. A source_type="SERVICE" with
+# source_entity="db.query('SELECT ...')" is clearly wrong but previously
+# passed the schema. These patterns reject that class of mistake.
+#
+# Patterns are deliberately permissive — they exist to catch obviously
+# malformed entities (embedded code, SQL, raw prose), not to enforce a
+# strict naming convention. The shapes they expect:
+#   SERVICE/TABLE/CACHE/DATABASE/ENV_VAR  → UPPER_SNAKE_CASE identifier
+#   FILE                                   → a path with an extension
+#   FUNCTION                               → lowerCamelCase / snake_case
+#   CONFIG_KEY                             → dotted or UPPER_SNAKE key
+#   QUEUE                                  → topic/stream name
+#   PROTOCOL                               → a known protocol literal
+# ─────────────────────────────────────────────────────────────────────────
+ENTITY_PATTERNS: Dict[str, "re.Pattern"] = {
+    "SERVICE":    re.compile(r"^[A-Z][A-Z0-9_]{2,40}$"),
+    "FILE":       re.compile(r"^[\w./\\-]+\.\w{1,8}$"),
+    "TABLE":      re.compile(r"^[A-Z][A-Z0-9_]{2,40}$"),
+    "CONFIG_KEY": re.compile(r"^[A-Z][A-Z0-9_.]{2,80}$"),
+    "FUNCTION":   re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{1,60}$"),
+    "QUEUE":      re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{1,60}$"),
+    "PROTOCOL":   re.compile(r"^(https?|grpc|amqp|tcp|udp|ws|wss|mssql|postgres(?:ql)?|mysql|redis)$"),
+    "ENV_VAR":    re.compile(r"^[A-Z][A-Z0-9_]{2,60}$"),
+    "CACHE":      re.compile(r"^[A-Z][A-Z0-9_]{2,40}$"),
+    "DATABASE":   re.compile(r"^[A-Z][A-Z0-9_]{2,40}$"),
+}
+
+
+def validate_entity_shape(entity: str, entity_type: str) -> bool:
+    """
+    Returns True if `entity` matches the expected shape for `entity_type`.
+    Unknown types (not in ENTITY_PATTERNS) are accepted — this layer only
+    rejects obvious mismatches, it does not gate on novel type names.
+    """
+    pattern = ENTITY_PATTERNS.get(entity_type)
+    if pattern is None:
+        return True
+    return bool(pattern.match((entity or "").strip()))
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Closed relationship vocabulary
 # Must include BOTH the base set AND the functional subset (Layer 6),
 # otherwise the contradiction guardrail is dead code.

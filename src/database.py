@@ -72,23 +72,35 @@ def initialize_database():
 
 def _migrate_knowledge_graph():
     """
-    Idempotent migration: add source_type / target_type columns to
+    Idempotent migration: add type / provenance columns to
     knowledge_graph if they don't exist yet. SQLite ALTER TABLE doesn't
     support IF NOT EXISTS for ADD COLUMN, so we check PRAGMA first.
 
     Safe to call on every initialize_database() — the existence check
     makes it a no-op once the migration has run.
+
+    Columns:
+      - source_type / target_type: EntityType literal (SERVICE, FILE, …)
+      - extractor:                who wrote this row (agent, middleware,
+                                  sweeper_l2, observation, plan)
+      - pass_number:              which extraction pass (0 for single-pass,
+                                  1..N for multi-pass consensus)
+      - raw_citation_score:       the Layer 4 score at commit time, useful
+                                  for "this row is on the edge of being
+                                  rejected — what happened?"
     """
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(knowledge_graph)")
     existing = {row[1] for row in cursor.fetchall()}
-    for col, default in (("source_type", "UNKNOWN"), ("target_type", "UNKNOWN")):
+    for col, default in (
+        ("source_type", "UNKNOWN"),
+        ("target_type", "UNKNOWN"),
+        ("extractor", "unknown"),
+        ("pass_number", "0"),
+        ("raw_citation_score", "0.0"),
+    ):
         if col not in existing:
-            # Backfill default for existing rows. We don't try to
-            # backfill *real* types from the entity name — the schema
-            # change is the point. Old rows just show UNKNOWN until
-            # they get re-extracted.
             cursor.execute(
                 f"ALTER TABLE knowledge_graph ADD COLUMN {col} TEXT DEFAULT '{default}'"
             )

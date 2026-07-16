@@ -81,6 +81,8 @@ class ScratchpadMiddleware:
             agent_id=agent_id,
             raw_chunk=raw_text,
             extraction_data=page_payload,
+            extractor="middleware",
+            pass_number=0,
         )
 
     def get_clean_context(self, session_id: str) -> str:

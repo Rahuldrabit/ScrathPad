@@ -239,8 +239,9 @@ class ScratchpadPoweredLLM:
         # In-process mode
         try:
             initialize_database()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ScratchpadPoweredLLM] Database initialization failed: {e}")
+            raise
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -489,52 +490,6 @@ class ScratchpadPoweredLLM:
 
     # ─── Internals: persistence ─────────────────────────────────────────
 
-    def _store_facts(self, facts: List[Dict[str, Any]], agent_id: str) -> int:
-        if not facts:
-            return 0
-        triplets = [
-            GraphTriplet(
-                source_entity=f["source_entity"],
-                relationship=f["relationship"],
-                target_entity=f["target_entity"],
-                citation_quote=f["citation_quote"],
-            )
-            for f in facts
-        ]
-        # The verification gate requires citation_quote to be a verbatim
-        # substring of raw_chunk. We pass the joined citations as the
-        # raw chunk so the gate has the exact text to match against.
-        raw_chunk = "\n".join(f["citation_quote"] for f in facts)
-        payload = PageExtractionPayload(
-            extracted_triplets=triplets,
-            unresolved_variables_mutations={},
-            is_chunk_completely_exhausted=True,
-        )
-
-        if self.middleware_url:
-            r = httpx.post(
-                f"{self.middleware_url}/v1/agent/update",
-                json={
-                    "agent_id": agent_id,
-                    "session_id": self.session_id,
-                    "raw_active_chunk": raw_chunk,
-                    "extracted_triplets": [t.model_dump() for t in triplets],
-                    "unresolved_variables_mutations": {},
-                    "is_chunk_completely_exhausted": True,
-                },
-                timeout=30.0,
-            )
-            if r.status_code == 200:
-                return r.json().get("verified_triplets_committed", 0)
-            return 0
-
-        return commit_page_data_to_sqlite(
-            session_id=self.session_id,
-            agent_id=agent_id,
-            raw_chunk=raw_chunk,
-            extraction_data=payload,
-        )
-
     def _mutate_variables(self, mutations: Dict[str, str]) -> None:
         if not mutations:
             return
@@ -598,6 +553,66 @@ class ScratchpadPoweredLLM:
         )
         conn.commit()
         conn.close()
+
+    def _store_facts(self, facts: List[Dict[str, Any]], agent_id: str) -> int:
+        if not facts:
+            return 0
+        triplets = [
+            GraphTriplet(
+                source_entity=f["source_entity"],
+                relationship=f["relationship"],
+                target_entity=f["target_entity"],
+                citation_quote=f["citation_quote"],
+            )
+            for f in facts
+        ]
+        # The verification gate requires citation_quote to be a verbatim
+        # substring of raw_chunk. We pass the joined citations as the
+        # raw chunk so the gate has the exact text to match against.
+        raw_chunk = "\n".join(f["citation_quote"] for f in facts)
+        payload = PageExtractionPayload(
+            extracted_triplets=triplets,
+            unresolved_variables_mutations={},
+            is_chunk_completely_exhausted=True,
+        )
+
+        if self.middleware_url:
+            r = httpx.post(
+                f"{self.middleware_url}/v1/agent/update",
+                json={
+                    "agent_id": agent_id,
+                    "session_id": self.session_id,
+                    "raw_active_chunk": raw_chunk,
+                    "extracted_triplets": [t.model_dump() for t in triplets],
+                    "unresolved_variables_mutations": {},
+                    "is_chunk_completely_exhausted": True,
+                },
+                timeout=30.0,
+            )
+            if r.status_code == 200:
+                return r.json().get("verified_triplets_committed", 0)
+            return 0
+
+        # Pick the right extractor tag based on the agent_id prefix.
+        # Format: "observation:tool:read_file" -> "observation"
+        # Format: "plan:entities"                -> "plan"
+        # Format: "plan:master"                  -> "plan"
+        # Format: "llm:tool_call"                -> "agent" (recorded as
+        #                                           part of the LLM call)
+        extractor = "agent"
+        if agent_id.startswith("observation"):
+            extractor = "observation"
+        elif agent_id.startswith("plan"):
+            extractor = "plan"
+
+        return commit_page_data_to_sqlite(
+            session_id=self.session_id,
+            agent_id=agent_id,
+            raw_chunk=raw_chunk,
+            extraction_data=payload,
+            extractor=extractor,
+            pass_number=0,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────

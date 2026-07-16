@@ -375,6 +375,212 @@ def test_view_includes_types():
           "<database>" in view.lower())
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Layer 2b: per-EntityType shape validation
+# ─────────────────────────────────────────────────────────────────────────
+def test_entity_shape_validation():
+    from schema import validate_entity_shape, ENTITY_PATTERNS
+
+    # All declared EntityTypes must have a pattern — a gap would silently
+    # disable the layer for that type.
+    check("shape: every EntityType has a pattern",
+          set(ENTITY_PATTERNS.keys())
+          == {"SERVICE", "FILE", "TABLE", "CONFIG_KEY", "FUNCTION",
+              "QUEUE", "PROTOCOL", "ENV_VAR", "CACHE", "DATABASE"})
+
+    # Valid shapes pass
+    check("shape: valid SERVICE passes",
+          validate_entity_shape("AUTH_SERVICE", "SERVICE"))
+    check("shape: valid FILE passes",
+          validate_entity_shape("src/main.py", "FILE"))
+    check("shape: valid FUNCTION passes",
+          validate_entity_shape("handleRequest", "FUNCTION"))
+    check("shape: valid PROTOCOL passes",
+          validate_entity_shape("https", "PROTOCOL"))
+    check("shape: valid DATABASE passes",
+          validate_entity_shape("POSTGRES_PRIMARY", "DATABASE"))
+
+    # Invalid shapes are rejected
+    check("shape: SQL fragment as SERVICE rejected",
+          not validate_entity_shape("db.query('SELECT * FROM users')", "SERVICE"))
+    check("shape: lowercase identifier as ENV_VAR rejected",
+          not validate_entity_shape("database_url", "ENV_VAR"))
+    check("shape: prose as DATABASE rejected",
+          not validate_entity_shape("the main postgres instance", "DATABASE"))
+    check("shape: unknown type is accepted (no false reject)",
+          validate_entity_shape("anything", "NOVEL_TYPE"))
+
+    # End-to-end: a triplet whose entity doesn't match its declared type
+    # is rejected by the commit pipeline with the right reason.
+    setup()
+    from engine import commit_page_data_to_sqlite
+
+    raw = "auth-service connects_to postgres_primary."
+    bad_shape = make_triplet(
+        # direction_check subject must match source_entity so the triplet
+        # passes Layer 1+2 and actually reaches the entity-shape gate.
+        direction_check="[db.query('SELECT * FROM users')] -> [connects_to] -> [POSTGRES_PRIMARY].",
+        source_type="SERVICE",
+        source_entity="db.query('SELECT * FROM users')",  # not a SERVICE shape
+        relationship="connects_to",
+        target_type="DATABASE",
+        target_entity="POSTGRES_PRIMARY",
+        citation_quote="auth-service connects_to postgres_primary",
+    )
+    saved = commit_page_data_to_sqlite(
+        "shape-test", "agent", raw, make_payload([bad_shape])
+    )
+    check("shape: bad source entity shape rejected in pipeline", saved == 0)
+
+    conn = sqlite3.connect(TEST_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT rejection_reason FROM rejected_triplets ORDER BY id DESC LIMIT 1"
+    )
+    reason = cur.fetchone()[0]
+    conn.close()
+    check("shape: rejection reason is 'bad_source_entity_shape'",
+          reason == "bad_source_entity_shape", f"got: {reason}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Layer 8: pinned facts (YAML-configured immutable constants)
+# ─────────────────────────────────────────────────────────────────────────
+PINNED_YAML = """\
+facts:
+  - source_entity: POSTGRES_PRIMARY
+    relationship: runs_on_port
+    target_entity: PORT_5432
+"""
+
+
+def test_pinned_facts():
+    import engine
+    from engine import commit_page_data_to_sqlite, reload_pinned_facts
+
+    setup()
+
+    # Swap in a temp pinned_facts.yaml next to engine.py.
+    engine_src = os.path.dirname(os.path.join(os.path.dirname(__file__), "..", "src", "engine.py"))
+    engine_src = os.path.abspath(engine_src)
+    yaml_path = os.path.join(engine_src, "pinned_facts.yaml")
+    backup = None
+    if os.path.exists(yaml_path):
+        with open(yaml_path, encoding="utf-8") as f:
+            backup = f.read()
+    try:
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write(PINNED_YAML)
+        reload_pinned_facts()
+
+        raw = "auth-service runs_on_port 5432. also auth-service runs_on_port 6000."
+
+        # 1. Triplet that MATCHES the pinned fact -> committed.
+        matching = make_triplet(
+            direction_check="[POSTGRES_PRIMARY] -> [runs_on_port] -> [PORT_5432].",
+            source_type="DATABASE",
+            source_entity="POSTGRES_PRIMARY",
+            target_type="CONFIG_KEY",
+            target_entity="PORT_5432",
+            relationship="runs_on_port",
+            citation_quote="auth-service runs_on_port 5432",
+        )
+        saved_match = commit_page_data_to_sqlite(
+            "pinned-match", "agent", raw, make_payload([matching])
+        )
+        check("pinned: matching fact is committed", saved_match == 1)
+
+        # 2. Triplet that CONTRADICTS the pinned fact -> rejected.
+        contradicting = make_triplet(
+            direction_check="[POSTGRES_PRIMARY] -> [runs_on_port] -> [PORT_6000].",
+            source_type="DATABASE",
+            source_entity="POSTGRES_PRIMARY",
+            target_type="CONFIG_KEY",
+            target_entity="PORT_6000",
+            relationship="runs_on_port",
+            citation_quote="auth-service runs_on_port 6000",
+        )
+        saved_contra = commit_page_data_to_sqlite(
+            "pinned-contra", "agent", raw, make_payload([contradicting])
+        )
+        check("pinned: contradicting fact is rejected", saved_contra == 0)
+
+        # 3. Rejection reason logged correctly.
+        conn = sqlite3.connect(TEST_DB)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT rejection_reason FROM rejected_triplets ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        conn.close()
+        reason = row[0] if row else None
+        check("pinned: rejection reason is 'contradicts_pinned_fact'",
+              reason == "contradicts_pinned_fact", f"got: {reason}")
+
+        # 4. An unrelated triplet is unaffected by pinned facts.
+        unrelated = make_triplet(
+            direction_check="[AUTH_SERVICE] -> [connects_to] -> [POSTGRES_PRIMARY].",
+            source_type="SERVICE",
+            source_entity="AUTH_SERVICE",
+            target_type="DATABASE",
+            target_entity="POSTGRES_PRIMARY",
+            relationship="connects_to",
+            citation_quote="auth-service connects_to postgres_primary.",
+        )
+        saved_unrelated = commit_page_data_to_sqlite(
+            "pinned-unrelated", "agent",
+            "auth-service connects_to postgres_primary.",
+            make_payload([unrelated]),
+        )
+        check("pinned: unrelated fact is unaffected", saved_unrelated == 1)
+    finally:
+        # Restore / remove the temp YAML so other tests aren't affected.
+        reload_pinned_facts()
+        if backup is not None:
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                f.write(backup)
+        else:
+            os.remove(yaml_path)
+        reload_pinned_facts()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Rejection-rate telemetry: rejection log is written (async broadcast path
+# is exercised; the sync SQLite write is what the test asserts on).
+# ─────────────────────────────────────────────────────────────────────────
+def test_rejection_telemetry():
+    setup()
+    from engine import commit_page_data_to_sqlite
+
+    raw = "auth-service connects to postgres_primary."
+    # Bad vocab -> rejected with a reason, logged to rejected_triplets.
+    bad = make_triplet(
+        direction_check="[AUTH_SERVICE] -> [frobnicate] -> [POSTGRES_PRIMARY].",
+        source_entity="AUTH_SERVICE",
+        target_entity="POSTGRES_PRIMARY",
+        relationship="frobnicate",
+        citation_quote="auth-service connects to postgres_primary",
+    )
+    saved = commit_page_data_to_sqlite(
+        "telemetry-test", "agent", raw, make_payload([bad])
+    )
+    check("telemetry: rejected triplet not committed", saved == 0)
+
+    conn = sqlite3.connect(TEST_DB)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT session_id, rejection_reason FROM rejected_triplets "
+        "WHERE session_id = ?",
+        ("telemetry-test",),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    check("telemetry: rejection logged for the session", len(rows) == 1)
+    check("telemetry: rejection reason captured",
+          rows and rows[0][1] == "bad_relationship_vocab",
+          f"got: {rows[0][1] if rows else None}")
+
+
 if __name__ == "__main__":
     test_layer1_vocabulary()
     test_layer2_direction_check()
@@ -384,6 +590,9 @@ if __name__ == "__main__":
     test_full_pipeline()
     test_migration()
     test_view_includes_types()
+    test_entity_shape_validation()
+    test_pinned_facts()
+    test_rejection_telemetry()
 
     if os.path.exists(TEST_DB):
         os.remove(TEST_DB)

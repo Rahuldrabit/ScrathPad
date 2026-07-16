@@ -12,7 +12,7 @@ from engine import commit_page_data_to_sqlite, compile_bounded_markdown_view
 from telemetry import telemetry_manager
 from client import ScratchpadMiddleware
 
-app = FastAPI(title="Scratchpad Context Middleware", version="2.0.0")
+app = FastAPI(title="Scratchpad Context Middleware", version="3.0.0")
 scratchpad = ScratchpadMiddleware()
 
 
@@ -24,42 +24,6 @@ class TurnInput(BaseModel):
 class DrillDownInput(BaseModel):
     session_id: str
     edge_id: str
-
-class LocalTelemetryManager:
-    def __init__(self):
-        # Maps session_id -> List of active WebSocket connections
-        self.active_connections: Dict[str, List[WebSocket]] = {}
-
-    async def connect(self, session_id: str, websocket: WebSocket):
-        await websocket.accept()
-        if session_id not in self.active_connections:
-            self.active_connections[session_id] = []
-        self.active_connections[session_id].append(websocket)
-
-    def disconnect(self, session_id: str, websocket: WebSocket):
-        if session_id in self.active_connections:
-            self.active_connections[session_id].remove(websocket)
-            if not self.active_connections[session_id]:
-                del self.active_connections[session_id]
-
-    async def broadcast(self, session_id: str, message: dict):
-        if session_id in self.active_connections:
-            payload = json.dumps(message)
-            # Safe concurrent broadcasting to all attached listeners
-            await asyncio.gather(
-                *[conn.send_text(payload) for conn in self.active_connections[session_id]],
-                return_exceptions=True
-            )
-
-# Instantiate the global real-time event dispatcher
-telemetry_manager = LocalTelemetryManager()
-
-# NOTE: the LocalTelemetryManager class used to be defined again, identically,
-# right here. telemetry.py already defines and instantiates it, but nothing
-# imported that module - main.py just kept its own separate copy, and any
-# fix made to one would silently not apply to the other. telemetry.py's
-# version is also slightly safer (it guards disconnect() against removing a
-# websocket that isn't in the list), so that's the one that now gets used.
 
 @app.on_event("startup")
 async def startup_event():
@@ -120,7 +84,9 @@ async def process_agent_memory_update(payload: AgentUpdateRequest):
         session_id=payload.session_id,
         agent_id=payload.agent_id,
         raw_chunk=payload.raw_active_chunk,
-        extraction_data=extraction_payload
+        extraction_data=extraction_payload,
+        extractor="agent",
+        pass_number=0,
     )
     
     rejected_count = len(payload.extracted_triplets) - saved_triplets_count

@@ -16,17 +16,17 @@ time comes.
 | 5 | Atomicity (no compound conjunctions) | **Shipped** | `aef404c` |
 | 6 | Contradiction check (`FUNCTIONAL_RELATIONSHIPS`) | **Shipped** | `aef404c` |
 | 7 | Rejection log table (`rejected_triplets`) | **Shipped** | `aef404c` |
-| 8 | Pinned facts (YAML config, hardcoded constants) | **Deferred** | — |
+| 8 | Pinned facts (YAML config, hardcoded constants) | **Shipped** | (this commit) |
 | — | L2 type inheritance (sweeper overrides LLM types) | **Shipped** | (this commit) |
+| — | Source-provenance columns + extractor history | **Shipped** | (this commit) |
+| — | Per-`EntityType` regex validation | **Shipped** | (this commit) |
+| — | Rejection-rate telemetry over WebSocket | **Shipped** | (this commit) |
 | — | Multi-pass consensus extraction (3-pass, keep ≥2) | **Deferred** | — |
-| — | Per-`EntityType` regex validation | **Deferred** | — |
-| — | Source-provenance columns + extractor history | **Deferred** | — |
-| — | Rejection-rate telemetry over WebSocket | **Deferred** | — |
 | — | Re-extraction API for sweeper-deactivated rows | **Deferred** | — |
 
 **The currently shipping pipeline.** Six layers, in order, all
-deterministic, all logged. Total tests: 78/78 (32 unit, 10 regression,
-36 e2e against Gemma 4B via LM Studio).
+deterministic, all logged. Total tests: 77/77 (51 unit, 10 regression,
+16 L2 type inheritance).
 
 ```python
 # engine.py: commit_page_data_to_sqlite, the canonical order

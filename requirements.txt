@@ -14,6 +14,9 @@ tiktoken==0.13.0       # Optional: more accurate token counts when available. It
                        # URL on first use (not bundled in the wheel); engine.py
                        # falls back to a character heuristic automatically if
                        # that fetch fails or the box has no network access.
+pyyaml==6.0.1          # Layer 8 pinned facts: engine.py lazy-loads pinned_facts.yaml.
+                       # App still boots if the YAML is absent/empty; this is only
+                       # needed once you actually populate pinned_facts.yaml.
 
 # Only needed if SCRATCHPAD_LLM_BACKEND=transformers:
 # instructor

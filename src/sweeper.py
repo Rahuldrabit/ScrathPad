@@ -221,11 +221,14 @@ class GraphSweeperDaemon:
 
                                 cursor.execute("""
                                     INSERT INTO knowledge_graph
-                                    (edge_id, session_id, source_entity, source_type,
+                                    (edge_id, session_id, agent_id, source_entity, source_type,
                                      relationship, target_entity, target_type,
-                                     citation_quote, hierarchy_level, is_active)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, TRUE)
-                                """, (l2_id, session_id, t.source_entity, t.source_type,
+                                     citation_quote, hierarchy_level, is_active,
+                                     extractor, pass_number, raw_citation_score)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, TRUE,
+                                            'sweeper_l2', 0, 0.0)
+                                """, (l2_id, session_id, f"sweeper:{community_id}",
+                                      t.source_entity, t.source_type,
                                       t.relationship, t.target_entity, t.target_type,
                                       t.citation_quote))
                             
