@@ -2,12 +2,42 @@ import asyncio
 import sqlite3
 import uuid
 import networkx as nx
+from collections import Counter
 from community import community_louvain # from python-louvain
 from database import get_db_connection
 from fastapi.concurrency import run_in_threadpool
 
 from inference import UniversalInferenceEngine
 from schema import L2CompressionPayload
+
+def _majority_l1_type(type_list):
+    """
+    Pick the dominant entity type from a community of L1 source rows.
+
+    Rules (in order):
+      1. If a single real type wins by 2+ over UNKNOWN, use it.
+      2. If multiple real types are present, use whichever has the
+         highest count. UNKNOWN loses to any real type.
+      3. If only UNKNOWN is present, return "UNKNOWN".
+      4. If the list is empty, return "UNKNOWN".
+
+    The sweeper uses this to OVERRIDE the LLM's L2 source_type /
+    target_type with the inherited L1 majority. The LLM is not allowed
+    to reclassify from scratch — that's a second place it can
+    hallucinate, and we already have ground-truth L1 type information.
+    """
+    if not type_list:
+        return "UNKNOWN"
+    counter = Counter(type_list)
+    # If UNKNOWN dominates, fall through to real types
+    top_type, top_count = counter.most_common(1)[0]
+    if top_type != "UNKNOWN" and top_count >= 2:
+        return top_type
+    real_types = {k: v for k, v in counter.items() if k != "UNKNOWN"}
+    if real_types:
+        return Counter(real_types).most_common(1)[0][0]
+    return "UNKNOWN"
+
 
 class GraphSweeperDaemon:
     def __init__(self, check_interval=10):
@@ -156,20 +186,48 @@ class GraphSweeperDaemon:
                                     f"summary triplet(s) from community {community_id}."
                                 )
 
+                            # ── L2 type inheritance ─────────────────────────
+                            # The LLM is not allowed to set the L2 source_type
+                            # or target_type. We compute the majority type from
+                            # the L1 community and override whatever the LLM
+                            # said. This is a free grounding signal: a
+                            # proposed L2 type that contradicts its source
+                            # community's types is now impossible.
+                            src_types = [t.get("source_type") or "UNKNOWN"
+                                         for t in raw_triplets]
+                            tgt_types = [t.get("target_type") or "UNKNOWN"
+                                         for t in raw_triplets]
+                            inherited_source_type = _majority_l1_type(src_types)
+                            inherited_target_type = _majority_l1_type(tgt_types)
+                            for t in filtered_l2_triplets:
+                                # The schema requires Literal values; we set
+                                # both as plain strings. Pydantic will accept
+                                # any value in the EntityType literal, but if
+                                # the majority was UNKNOWN we leave the
+                                # schema default (SERVICE) alone.
+                                if inherited_source_type != "UNKNOWN":
+                                    t.source_type = inherited_source_type
+                                if inherited_target_type != "UNKNOWN":
+                                    t.target_type = inherited_target_type
+
                             cursor.execute("BEGIN TRANSACTION;")
-                            
+
                             first_l2_id = None
-                            
+
                             for i, t in enumerate(filtered_l2_triplets):
                                 l2_id = str(uuid.uuid4())
                                 if i == 0:
                                     first_l2_id = l2_id
-                                    
+
                                 cursor.execute("""
-                                    INSERT INTO knowledge_graph 
-                                    (edge_id, session_id, source_entity, relationship, target_entity, citation_quote, hierarchy_level, is_active)
-                                    VALUES (?, ?, ?, ?, ?, ?, 2, TRUE)
-                                """, (l2_id, session_id, t.source_entity, t.relationship, t.target_entity, t.citation_quote))
+                                    INSERT INTO knowledge_graph
+                                    (edge_id, session_id, source_entity, source_type,
+                                     relationship, target_entity, target_type,
+                                     citation_quote, hierarchy_level, is_active)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, TRUE)
+                                """, (l2_id, session_id, t.source_entity, t.source_type,
+                                      t.relationship, t.target_entity, t.target_type,
+                                      t.citation_quote))
                             
                             if first_l2_id:
                                 cursor.execute(f"""

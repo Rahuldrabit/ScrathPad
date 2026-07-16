@@ -17,7 +17,7 @@ time comes.
 | 6 | Contradiction check (`FUNCTIONAL_RELATIONSHIPS`) | **Shipped** | `aef404c` |
 | 7 | Rejection log table (`rejected_triplets`) | **Shipped** | `aef404c` |
 | 8 | Pinned facts (YAML config, hardcoded constants) | **Deferred** | — |
-| — | L2 type inheritance (sweeper overrides LLM types) | **Deferred** | — |
+| — | L2 type inheritance (sweeper overrides LLM types) | **Shipped** | (this commit) |
 | — | Multi-pass consensus extraction (3-pass, keep ≥2) | **Deferred** | — |
 | — | Per-`EntityType` regex validation | **Deferred** | — |
 | — | Source-provenance columns + extractor history | **Deferred** | — |
