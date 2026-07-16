@@ -22,6 +22,8 @@ class UniversalInferenceEngine:
             return self._execute_ollama(prompt, system_prompt, response_schema)
         elif self.backend_type == "llamacpp":
             return self._execute_llamacpp(prompt, system_prompt, response_schema)
+        elif self.backend_type == "lmstudio":
+            return self._execute_lmstudio(prompt, system_prompt, response_schema)
         elif self.backend_type == "transformers":
             return self._execute_transformers(prompt, system_prompt, response_schema)
         else:
@@ -57,6 +59,46 @@ class UniversalInferenceEngine:
         response.raise_for_status()
         
         raw_json_string = response.json()["content"]
+        return response_schema.model_validate_json(raw_json_string)
+
+    def _execute_lmstudio(self, prompt: str, system_prompt: str, response_schema: Type[T]) -> T:
+        """
+        LM Studio with OpenAI-compatible /v1/chat/completions endpoint.
+        Uses structured output via response_format + json_schema (same as OpenAI SDK).
+        """
+        lmstudio_base = os.getenv("LMSTUDIO_API_URL", "http://localhost:1234/v1")
+        lmstudio_model = os.getenv("SCRATCHPAD_MODEL_NAME", self.model_name)
+
+        # Wrap raw Pydantic schema with the name + strict fields that
+        # OpenAI-compatible endpoints require at the top level.
+        raw_schema = response_schema.model_json_schema()
+        schema_name = raw_schema.get("title", response_schema.__name__)
+        wrapped_schema = {
+            "name": schema_name,
+            "strict": True,
+            "schema": raw_schema
+        }
+
+        payload = {
+            "model": lmstudio_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": wrapped_schema
+            }
+        }
+
+        response = httpx.post(f"{lmstudio_base}/chat/completions", json=payload, timeout=120.0)
+        response.raise_for_status()
+        data = response.json()
+
+        # LM Studio returns OpenAI-compatible response shape
+        raw_json_string = data["choices"][0]["message"]["content"]
         return response_schema.model_validate_json(raw_json_string)
 
     def _execute_transformers(self, prompt: str, system_prompt: str, response_schema: Type[T]) -> T:
