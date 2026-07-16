@@ -198,14 +198,20 @@ def test_agent_update_endpoint_end_to_end():
                 "raw_active_chunk": raw_chunk,
                 "extracted_triplets": [
                     {
+                        "direction_check": "[AUTH_SERVICE] -> [connects_to] -> [POSTGRES_PRIMARY].",
+                        "source_type": "SERVICE",
                         "source_entity": "AUTH_SERVICE",
                         "relationship": "connects_to",
+                        "target_type": "DATABASE",
                         "target_entity": "POSTGRES_PRIMARY",
                         "citation_quote": "auth-service connects to postgres_primary",
                     },
                     {
+                        "direction_check": "[GHOST_SERVICE] -> [calls] -> [NOWHERE].",
+                        "source_type": "SERVICE",
                         "source_entity": "GHOST_SERVICE",
                         "relationship": "calls",
+                        "target_type": "SERVICE",
                         "target_entity": "NOWHERE",
                         "citation_quote": "not present in the raw chunk at all",
                     },

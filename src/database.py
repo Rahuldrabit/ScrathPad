@@ -67,6 +67,33 @@ def initialize_database():
     
     conn.commit()
     conn.close()
+    _migrate_knowledge_graph()
+
+
+def _migrate_knowledge_graph():
+    """
+    Idempotent migration: add source_type / target_type columns to
+    knowledge_graph if they don't exist yet. SQLite ALTER TABLE doesn't
+    support IF NOT EXISTS for ADD COLUMN, so we check PRAGMA first.
+
+    Safe to call on every initialize_database() — the existence check
+    makes it a no-op once the migration has run.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(knowledge_graph)")
+    existing = {row[1] for row in cursor.fetchall()}
+    for col, default in (("source_type", "UNKNOWN"), ("target_type", "UNKNOWN")):
+        if col not in existing:
+            # Backfill default for existing rows. We don't try to
+            # backfill *real* types from the entity name — the schema
+            # change is the point. Old rows just show UNKNOWN until
+            # they get re-extracted.
+            cursor.execute(
+                f"ALTER TABLE knowledge_graph ADD COLUMN {col} TEXT DEFAULT '{default}'"
+            )
+    conn.commit()
+    conn.close()
 
 if __name__ == "__main__":
     initialize_database()

@@ -1,6 +1,12 @@
 import uuid
 from database import get_db_connection
-from schema import PageExtractionPayload
+from schema import (
+    PageExtractionPayload,
+    ALLOWED_RELATIONSHIPS,
+    FUNCTIONAL_RELATIONSHIPS,
+    validate_relationship,
+    validate_direction,
+)
 from rapidfuzz import fuzz, process as rf_process
 
 # --- Token counting: real tokenizer when available, heuristic fallback ---
@@ -111,9 +117,112 @@ def verify_citation(raw_chunk: str, citation: str) -> bool:
         return False
     return citation.strip() in raw_chunk
 
+
+# Layer 4: citation quality scoring.
+# Beyond "is it a substring?" — also how long, how unique, how informative.
+# Citations that are too short, repeated elsewhere, or trivial are
+# suspicious and likely fabricated.
+MIN_CITATION_LEN = 8
+MAX_CITATION_LEN = 240
+CITATION_SCORE_THRESHOLD = 0.5
+
+# Atomicity check: compound facts joining two claims with a conjunction
+# are the #1 source of hallucinations. Forcing atomic facts means the
+# verification gate can match each one cleanly.
+COMPOUND_CONJUNCTIONS = (" and ", " plus ", " as well as ", " also ")
+
+
+def citation_score(citation: str, raw_chunk: str) -> float:
+    """
+    Quality score in [0.0, 1.0]. Returns 0.0 if citation is missing
+    or not a substring of raw_chunk. Otherwise:
+      + 0.5 base (passing substring check is the main signal)
+      + 0.3 if the citation appears exactly once in the chunk (specific)
+      - 0.4 if the citation is < 20 chars OR < 3 words (trivial)
+    Threshold 0.5: typical good citations ("auth-service connects to
+    postgres_primary", "INSERT INTO payment_ledger (order_id, ...)")
+    score 0.8+. Trivial citations like "import", "TODO", "//" score 0.1-0.4.
+    """
+    if not citation or citation not in raw_chunk:
+        return 0.0
+    score = 0.5
+    if raw_chunk.count(citation) == 1:
+        score += 0.3
+    if len(citation) < 20 or len(citation.split()) < 3:
+        score -= 0.4
+    return max(score, 0.0)
+
+
+# Layer 6: contradiction check.
+# Only meaningful for FUNCTIONAL_RELATIONSHIPS, where a single source
+# can only have one value for a given key (one port, one IP, one region).
+# "A imports B" + "A imports C" is fine. "A runs_on_port 5432" +
+# "A runs_on_port 6000" is a contradiction.
+def check_contradiction(cursor, session_id: str, source_entity: str,
+                        relationship: str, target_entity: str) -> tuple:
+    """
+    Returns (contradicts: bool, reason: str).
+    For FUNCTIONAL_RELATIONSHIPS only: if there's already a different
+    target for the same (source, relationship) pair, that's a contradiction.
+    """
+    rel = relationship.lower().strip()
+    if rel not in FUNCTIONAL_RELATIONSHIPS:
+        return False, ""
+    cursor.execute(
+        """
+        SELECT DISTINCT target_entity FROM knowledge_graph
+        WHERE session_id = ? AND source_entity = ?
+          AND relationship = ? AND is_active = TRUE
+        """,
+        (session_id, source_entity, rel),
+    )
+    existing = {row["target_entity"] for row in cursor.fetchall()}
+    if existing and target_entity not in existing:
+        existing_first = next(iter(existing))
+        return True, (
+            f"contradicts existing: {source_entity} {rel} -> {existing_first} "
+            f"(attempting to overwrite with {target_entity})"
+        )
+    return False, ""
+
+
+# Rejection log table — keep one row per rejected triplet so we can
+# analyze failure modes and tighten the filters over time.
+REJECTION_TABLE = """
+    CREATE TABLE IF NOT EXISTS rejected_triplets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        proposed_json TEXT,
+        rejection_reason TEXT,
+        raw_chunk TEXT,
+        rejected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+"""
+
+
+def _log_rejection(cursor, session_id, triplet, reason, raw_chunk):
+    """Persist a rejected triplet for later analysis."""
+    cursor.execute(
+        """
+        INSERT INTO rejected_triplets
+            (session_id, proposed_json, rejection_reason, raw_chunk)
+        VALUES (?, ?, ?, ?)
+        """,
+        (session_id, triplet.model_dump_json(), reason, (raw_chunk or "")[:4000]),
+    )
+
+
 def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, extraction_data: PageExtractionPayload) -> int:
     """
     Runs the deterministic verification engine and bulk upserts verified facts.
+
+    Verification layers, applied in order to each triplet:
+      1. direction_check consistency  (in-schema CoT, post-parse)
+      2. closed relationship vocabulary (ALLOWED_RELATIONSHIPS)
+      3. citation substring match      (existing)
+      4. citation quality score        (length / uniqueness / triviality)
+      5. atomicity                     (no compound conjunctions)
+      6. contradiction check           (FUNCTIONAL_RELATIONSHIPS only)
 
     NOTE: this is intentionally a plain function, not async def. It has no
     internal await - it is pure blocking sqlite3 I/O - and main.py calls it
@@ -131,32 +240,71 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
     conn = get_db_connection()
     cursor = conn.cursor()
     verified_count = 0
-    
+
     try:
         cursor.execute("BEGIN TRANSACTION;")
-        
+
         # Ensure session exists to prevent foreign key constraints from failing
         cursor.execute("INSERT OR IGNORE INTO sessions (session_id) VALUES (?)", (session_id,))
-        
+
+        # Ensure the rejection log table exists (idempotent)
+        cursor.execute(REJECTION_TABLE)
+
         for triplet in extraction_data.extracted_triplets:
-            if not verify_citation(raw_chunk, triplet.citation_quote):
-                print(f"[GUARDRAIL] Rejected hallucinated triplet: {triplet.source_entity} -> {triplet.target_entity}")
-                continue 
-                
+            reason = None
+
+            # Layer 1: in-schema CoT — model said who-acts-on-whom,
+            # now verify what it filled in matches.
+            if not validate_direction(triplet):
+                reason = "direction_check_mismatch"
+
+            # Layer 2: closed relationship vocabulary
+            elif not validate_relationship(triplet.relationship):
+                reason = "bad_relationship_vocab"
+
+            # Layer 3: citation substring match (existing)
+            elif not verify_citation(raw_chunk, triplet.citation_quote):
+                reason = "citation_mismatch"
+
+            # Layer 4: citation quality score
+            elif citation_score(triplet.citation_quote, raw_chunk) < CITATION_SCORE_THRESHOLD:
+                reason = "low_citation_score"
+
+            # Layer 5: atomicity — no compound conjunctions
+            elif any(c in (triplet.citation_quote or "").lower() for c in COMPOUND_CONJUNCTIONS):
+                reason = "compound_fact"
+
+            if reason is not None:
+                _log_rejection(cursor, session_id, triplet, reason, raw_chunk)
+                print(f"[GUARDRAIL] Rejected: {triplet.source_entity} -> {triplet.target_entity} | {reason}")
+                continue
+
             src = canonicalize_entity(cursor, session_id, triplet.source_entity)
             tgt = canonicalize_entity(cursor, session_id, triplet.target_entity)
-                
+
+            # Layer 6: contradiction check (FUNCTIONAL_RELATIONSHIPS only)
+            contradicts, why = check_contradiction(
+                cursor, session_id, src, triplet.relationship, tgt
+            )
+            if contradicts:
+                _log_rejection(cursor, session_id, triplet, why, raw_chunk)
+                print(f"[GUARDRAIL] Rejected: {why}")
+                continue
+
             edge_id = str(uuid.uuid4())
             cursor.execute("""
-                INSERT OR REPLACE INTO knowledge_graph 
-                (edge_id, session_id, agent_id, source_entity, relationship, target_entity, citation_quote, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)
-            """, (edge_id, session_id, agent_id, src, 
-                  triplet.relationship.lower().strip(), tgt, 
+                INSERT OR REPLACE INTO knowledge_graph
+                (edge_id, session_id, agent_id, source_entity, source_type,
+                 relationship, target_entity, target_type, citation_quote, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+            """, (edge_id, session_id, agent_id, src,
+                  triplet.source_type,
+                  triplet.relationship.lower().strip(), tgt,
+                  triplet.target_type,
                   triplet.citation_quote.strip()))
-            
+
             verified_count += 1
-            
+
         for var_name, status in extraction_data.unresolved_variables_mutations.items():
             var_id = f"{session_id}_{var_name}"
             if status.upper() == "RESOLVED":
@@ -166,7 +314,7 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
                     INSERT OR IGNORE INTO unresolved_variables (variable_id, session_id, variable_name, status)
                     VALUES (?, ?, ?, ?)
                 """, (var_id, session_id, var_name.upper().strip(), status.upper().strip()))
-                
+
         conn.commit()
     except Exception as e:
         conn.execute("ROLLBACK;")
@@ -174,7 +322,7 @@ def commit_page_data_to_sqlite(session_id: str, agent_id: str, raw_chunk: str, e
         raise e
     finally:
         conn.close()
-        
+
     return verified_count
 
 def compile_bounded_markdown_view(
@@ -202,8 +350,8 @@ def compile_bounded_markdown_view(
 
     cursor.execute(
         """
-        SELECT source_entity, relationship, target_entity, citation_quote,
-               hierarchy_level, edge_id
+        SELECT source_entity, source_type, relationship, target_entity,
+               target_type, citation_quote, hierarchy_level, edge_id
         FROM knowledge_graph
         WHERE session_id = ? AND is_active = TRUE
         ORDER BY relevance_score DESC
@@ -240,15 +388,22 @@ def compile_bounded_markdown_view(
     else:
         used = count_tokens(graph_lines[0])
         for row in graph_rows:
+            # Type tag shown when known — UNKNOWN means the row was
+            # written before the type columns existed (pre-migration).
+            stype = (row["source_type"] or "UNKNOWN").lower()
+            ttype = (row["target_type"] or "UNKNOWN").lower()
+            type_tag_src = f" <{stype}>" if stype != "unknown" else ""
+            type_tag_tgt = f" <{ttype}>" if ttype != "unknown" else ""
             if row["hierarchy_level"] == 2:
                 line = (
-                    f"* `[{row['source_entity']}]` --({row['relationship']})--> "
-                    f"`[{row['target_entity']}]` `[COMPRESSED | drill-down id: {row['edge_id']}]`"
+                    f"* `[{row['source_entity']}]{type_tag_src}` --({row['relationship']})--> "
+                    f"`[{row['target_entity']}]{type_tag_tgt}` "
+                    f"`[COMPRESSED | drill-down id: {row['edge_id']}]`"
                 )
             else:
                 line = (
-                    f"* `[{row['source_entity']}]` --({row['relationship']})--> "
-                    f"`[{row['target_entity']}]`\n"
+                    f"* `[{row['source_entity']}]{type_tag_src}` --({row['relationship']})--> "
+                    f"`[{row['target_entity']}]{type_tag_tgt}`\n"
                     f"  └── Source Citation: \"{row['citation_quote']}\""
                 )
             line_tokens = count_tokens(line)
