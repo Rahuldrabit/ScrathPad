@@ -50,10 +50,7 @@ def count_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-import re
-
-def _strip_separators(s: str) -> str:
-    return re.sub(r'[\s_\-]+', '', s)
+from text_matching import strip_separators as _strip_separators
 
 
 def canonicalize_entity(cursor, session_id: str, incoming_entity: str, threshold: int = 85) -> str:
@@ -389,7 +386,8 @@ def commit_page_data_to_sqlite(
 
             if reason is not None:
                 _log_rejection(cursor, session_id, triplet, reason, raw_chunk, score=score)
-                print(f"[GUARDRAIL] Rejected: {triplet.source_entity} -> {triplet.target_entity} | {reason}")
+                extra = f" | direction_check={triplet.direction_check!r}" if reason == "direction_check_mismatch" else ""
+                print(f"[GUARDRAIL] Rejected: {triplet.source_entity} -> {triplet.target_entity} | {reason}{extra}")
                 continue
 
             src = canonicalize_entity(cursor, session_id, triplet.source_entity)
@@ -452,10 +450,77 @@ def commit_page_data_to_sqlite(
 
     return verified_count
 
+def _apply_query_aware_boost(rows: list, query: str, k_hops: int) -> list:
+    """
+    Re-orders active graph rows so ones relevant to the CURRENT query are
+    prioritized ahead of pure global relevance_score ranking.
+
+    Without this, compile_bounded_markdown_view ranks every active fact by
+    a single static relevance_score with no notion of "relevant to what's
+    being asked right now." Under a tight token budget on a long session,
+    this reproduces the exact "lost in the middle" failure the scratchpad
+    exists to prevent, just moved from the raw context window to the
+    compression layer: an early root-cause fact can lose out to later,
+    more-recently-referenced facts that happen to score higher globally
+    but have nothing to do with the current question.
+
+    Builds a lightweight in-memory graph from the rows themselves (not
+    persisted, not the sweeper's NetworkX layer - this is query-scoped and
+    thrown away after use), finds which known entities are named in the
+    query text, and expands a k-hop neighborhood around them. Rows with
+    either endpoint in that neighborhood are boosted into a top tier;
+    everything else keeps its normal relevance_score ordering below that
+    tier. If no known entity is named in the query at all, falls back to
+    pure global ranking rather than guessing at relevance.
+
+    Entity matching against the query text uses the same separator-
+    stripped normalization as canonicalize_entity/validate_direction
+    (strip_separators, uppercase) - a raw substring check would miss
+    "API_GATEWAY" against a query asking about "the api gateway", for the
+    identical underscore/space/case reasons already fixed elsewhere in
+    this file.
+    """
+    import networkx as nx
+    from text_matching import strip_separators
+
+    if not query or not rows:
+        return sorted(rows, key=lambda r: r["relevance_score"] or 0.0, reverse=True)
+
+    G = nx.Graph()
+    for r in rows:
+        G.add_edge(r["source_entity"], r["target_entity"])
+
+    query_normalized = strip_separators(query.upper())
+    mentioned = {
+        e for e in G.nodes()
+        if strip_separators(e.upper()) in query_normalized
+    }
+
+    if not mentioned:
+        return sorted(rows, key=lambda r: r["relevance_score"] or 0.0, reverse=True)
+
+    neighborhood = set(mentioned)
+    frontier = set(mentioned)
+    for _ in range(max(k_hops, 0)):
+        next_frontier = set()
+        for node in frontier:
+            next_frontier.update(G.neighbors(node))
+        neighborhood.update(next_frontier)
+        frontier = next_frontier
+
+    def sort_key(r):
+        in_neighborhood = r["source_entity"] in neighborhood or r["target_entity"] in neighborhood
+        return (1 if in_neighborhood else 0, r["relevance_score"] or 0.0)
+
+    return sorted(rows, key=sort_key, reverse=True)
+
+
 def compile_bounded_markdown_view(
     session_id: str,
     max_tokens: int = 6000,
     footer_reserve_tokens: int = 60,
+    query: str = None,
+    k_hops: int = 2,
 ) -> str:
     """
     Assembles a token-bounded GitHub-flavored Markdown view from SQLite.
@@ -464,8 +529,14 @@ def compile_bounded_markdown_view(
     design rule): the Unresolved Variables Matrix is always included in
     full - it stays small by nature and is the thing an agent least wants
     to lose. Remaining budget after that goes to knowledge_graph rows,
-    highest relevance_score first, until the budget runs out. Anything cut
+    ranked highest-priority first, until the budget runs out. Anything cut
     is reported in a footer rather than silently vanishing.
+
+    When `query` is given, rows within `k_hops` of any entity named in the
+    query are boosted ahead of pure global relevance_score ranking (see
+    _apply_query_aware_boost). When query is None, ranking is unchanged
+    from before - pure global relevance_score, for backward compatibility
+    with any caller that doesn't have a specific question to bias toward.
 
     Replaces the old compile_graph_memory_to_markdown, which had no
     is_active filter, no ordering, and no budget at all - it would return
@@ -478,14 +549,14 @@ def compile_bounded_markdown_view(
     cursor.execute(
         """
         SELECT source_entity, source_type, relationship, target_entity,
-               target_type, citation_quote, hierarchy_level, edge_id
+               target_type, citation_quote, hierarchy_level, edge_id,
+               relevance_score
         FROM knowledge_graph
         WHERE session_id = ? AND is_active = TRUE
-        ORDER BY relevance_score DESC
         """,
         (session_id,),
     )
-    graph_rows = cursor.fetchall()
+    graph_rows = _apply_query_aware_boost(cursor.fetchall(), query, k_hops)
 
     cursor.execute(
         "SELECT variable_name, status FROM unresolved_variables WHERE session_id = ?",

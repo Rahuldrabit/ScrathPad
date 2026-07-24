@@ -125,19 +125,33 @@ def parse_direction(direction_check: str):
     return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
 
 
+from text_matching import fuzzy_equal
+
+
 def validate_direction(t: "GraphTriplet") -> bool:
     """
     Second line of defense for the in-schema CoT: the model's stated
     direction must match the fields it filled in. This catches the case
     where the LLM 'thought' one direction but emitted the opposite.
+
+    Uses fuzzy matching rather than exact equality. direction_check and
+    source_entity/target_entity are two independently-generated fields
+    filled in by the same model within one response, and in practice they
+    drift in phrasing even when the model got the direction genuinely
+    right - "AUTH_SERVICE pods" in one field vs "AUTH_SERVICE" in the
+    other is not a direction error, it's the same entity described two
+    ways. A genuine subject/object swap still fails this check: swapped
+    entities are not fuzzy-similar to each other unless they happen to
+    share very similar names, which a real swap error essentially never
+    does.
     """
     parsed = parse_direction(t.direction_check)
     if parsed is None:
         return False
     subj, _verb, obj = parsed
     return (
-        subj.upper() == t.source_entity.strip().upper()
-        and obj.upper() == t.target_entity.strip().upper()
+        fuzzy_equal(subj, t.source_entity)
+        and fuzzy_equal(obj, t.target_entity)
     )
 
 
@@ -168,7 +182,9 @@ class GraphTriplet(BaseModel):
         ...,
         description=(
             "ONE LINE in exactly the form: [Subject] -> [Verb] -> [Object]. "
-            "State who acts on whom BEFORE filling the fields below. "
+            "State who acts on whom BEFORE filling the fields below. Name "
+            "the SAME entities here that you will write in source_entity "
+            "and target_entity - use identical short names in both places. "
             "Example: [ORDER_SERVICE] -> [calls] -> [PAYMENT_GATEWAY]."
         ),
     )
@@ -176,7 +192,16 @@ class GraphTriplet(BaseModel):
         ..., description="Type of source_entity. MUST be one of the EntityType literals."
     )
     source_entity: str = Field(
-        ..., description="Subject noun, class, or env var in uppercase."
+        ...,
+        description=(
+            "Subject noun, class, or env var in uppercase. Use a SHORT "
+            "canonical identifier, e.g. AUTH_SERVICE - not a full phrase "
+            "copied from the text, e.g. not 'AUTH SERVICE PODS' or "
+            "'THE AUTH SERVICE CONNECTION POOL'. If the fact you're "
+            "describing is really about a metric, count, or timestamp "
+            "rather than a second named entity, skip this triplet rather "
+            "than putting the value in an entity field."
+        ),
     )
     relationship: str = Field(
         ...,
@@ -190,7 +215,12 @@ class GraphTriplet(BaseModel):
         ..., description="Type of target_entity. MUST be one of the EntityType literals."
     )
     target_entity: str = Field(
-        ..., description="Object noun, config, or destination in uppercase."
+        ...,
+        description=(
+            "Object noun, config, or destination in uppercase. Same rule "
+            "as source_entity: a short canonical identifier, not a "
+            "descriptive phrase, and not a metric/count/timestamp value."
+        ),
     )
     citation_quote: str = Field(
         ..., description="Exact substring from raw code validating this connection."

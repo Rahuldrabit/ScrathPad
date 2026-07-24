@@ -77,8 +77,12 @@ The `knowledge_graph` table now supports two hierarchy levels:
 
 Compressed L1 nodes are marked `is_active = FALSE` and linked via `parent_node_id` to their L2 parent — enabling full drill-down retrieval.
 
-### ✅ Entity Disambiguation Engine (`src/engine.py`)
-Before any entity is written to the graph, it is canonicalized via `rapidfuzz` fuzzy matching against all existing active nodes. This prevents synonym fragmentation (e.g., `FASTAPI_ROUTER` vs. `FAST_API_ROUTER` collapsing into a single canonical node).
+### ✅ Entity Disambiguation Engine (`src/engine.py`, `src/text_matching.py`)
+Before any entity is written to the graph, it is canonicalized via shared `rapidfuzz` fuzzy matching logic (`text_matching.py`) against all existing active nodes. This prevents synonym fragmentation (e.g., `FASTAPI_ROUTER` vs. `FAST_API_ROUTER` collapsing into a single canonical node). This same fuzzy matching is now used in schema validation to enforce `direction_check` robustness against phrasing drift.
+
+### ✅ Query-Aware Retrieval Boost (`src/engine.py`)
+The `compile_bounded_markdown_view` engine function now accepts an optional `query` parameter. When provided, the engine dynamically boosts retrieval scores for entities within a `k_hops` neighborhood of any entity named in the query. This ensures critical root-cause facts aren't lost under tight token budgets when competing against highly-referenced but irrelevant facts.
+
 
 ### ✅ Background Graph Sweeper Daemon (`src/sweeper.py`)
 Refactored into a `GraphSweeperDaemon` class:
@@ -112,9 +116,13 @@ Two new endpoints exposed for any non-Python client (Node.js, Go, curl, etc.):
 |---|---|---|
 | `POST` | `/v1/middleware/process` | Ingest messy input → return clean scratchpad |
 | `POST` | `/v1/middleware/drill-down` | Expand a compressed L2 node back to its L1 history |
+| `GET`  | `/v1/session/{id}/memory` | Fetch active memory graph (now accepts optional `query` parameter for query-aware retrieval boost) |
 
-### ✅ Deterministic Hallucination Guardrails (`src/engine.py`, `src/schema.py`)
+### ✅ Deterministic Hallucination Guardrails (`src/engine.py`, `src/schema.py`, `src/scratchpad_agent.py`)
 The verification gate is a multi-layer deterministic pipeline — no LLM judgement involved in the reject/commit decision. Every rejection is logged to `rejected_triplets` for later analysis, and (when a dashboard is attached) broadcast live over the telemetry WebSocket.
+
+**Answer Grounding Gate:** The LLM wrapper (`ScratchpadPoweredLLM`) now includes a final pass `_check_response_grounding` step that scans the model's final response text for entity-shaped tokens. If it detects a named entity that was never observed in the session's verified graph, it triggers a grounding warning to prevent entity confabulations.
+
 
 | Layer | Check | Rejection Reason |
 |---|---|---|

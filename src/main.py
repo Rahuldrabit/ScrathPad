@@ -52,14 +52,22 @@ async def initialize_session(payload: SessionInitRequest):
         conn.close()
 
 @app.get("/v1/session/{session_id}/memory", response_model=MemoryViewResponse)
-async def get_session_memory_view(session_id: str, max_tokens: int = 6000):
+async def get_session_memory_view(session_id: str, max_tokens: int = 6000, query: str = None):
     """
     Compiles the relational data matrix out of SQLite directly into
     a token-bounded GitHub-Flavored Markdown text layer for agents to read.
+
+    query is optional: when given, retrieval is biased toward entities
+    within a few hops of whatever the query names, ahead of pure global
+    relevance_score - see engine.py::_apply_query_aware_boost. Omitting it
+    preserves the old pure-relevance-score behavior.
     """
     try:
         # DB reads are fast, but running inside threadpool keeps event loop pristine
-        markdown_text = await run_in_threadpool(compile_bounded_markdown_view, session_id, max_tokens)
+        markdown_text = await run_in_threadpool(
+            compile_bounded_markdown_view,
+            session_id=session_id, max_tokens=max_tokens, query=query,
+        )
         return MemoryViewResponse(session_id=session_id, markdown_view=markdown_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
