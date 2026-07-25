@@ -357,12 +357,6 @@ def commit_page_data_to_sqlite(
             # Layer 1: in-schema CoT — model said who-acts-on-whom,
             # now verify what it filled in matches.
             if not validate_direction(triplet):
-                # Auto-repair: if direction_check is malformed but the other
-                # fields are fine, synthesize the correct direction_check from
-                # them. The CoT's value is in forcing the model to think about
-                # direction BEFORE filling in entity fields — once the fields
-                # are locked in, a malformed direction_check string is a
-                # formatting failure, not a reasoning failure.
                 repaired = f"[{triplet.source_entity}] -> [{triplet.relationship}] -> [{triplet.target_entity}]"
                 from schema import parse_direction
                 if parse_direction(repaired) is not None:
@@ -373,28 +367,37 @@ def commit_page_data_to_sqlite(
                     reason = "direction_check_mismatch"
 
             # Layer 2: closed relationship vocabulary
-            elif not validate_relationship(triplet.relationship):
+            if reason is None and not validate_relationship(triplet.relationship):
                 reason = "bad_relationship_vocab"
 
-            # Layer 2b: per-EntityType shape validation
-            # Cheap regex gate: the entity string must look like its
-            # declared type. Catches obvious garbage like a raw SQL
-            # fragment labeled as a SERVICE.
-            elif not validate_entity_shape(triplet.source_entity, triplet.source_type):
-                reason = "bad_source_entity_shape"
-            elif not validate_entity_shape(triplet.target_entity, triplet.target_type):
-                reason = "bad_target_entity_shape"
+            if reason is None:
+                # Layer 2b: per-EntityType shape validation
+                for field_prefix in ("source", "target"):
+                    e_type = getattr(triplet, f"{field_prefix}_type")
+                    e_val = getattr(triplet, f"{field_prefix}_entity")
+                    
+                    if e_type == "FILE" and "." not in e_val:
+                        setattr(triplet, f"{field_prefix}_type", "SERVICE")
+                        print(f"[GUARDRAIL] Auto-repaired {field_prefix}_type for: {e_val} (FILE -> SERVICE)")
+                    elif e_type == "PROTOCOL" and e_val.lower() not in {"http", "https", "grpc", "amqp", "tcp", "udp", "ws", "wss", "mssql", "postgres", "postgresql", "mysql", "redis"}:
+                        setattr(triplet, f"{field_prefix}_type", "SERVICE")
+                        print(f"[GUARDRAIL] Auto-repaired {field_prefix}_type for: {e_val} (PROTOCOL -> SERVICE)")
 
+                if not validate_entity_shape(triplet.source_entity, triplet.source_type):
+                    reason = "bad_source_entity_shape"
+                elif not validate_entity_shape(triplet.target_entity, triplet.target_type):
+                    reason = "bad_target_entity_shape"
+                    
             # Layer 3: citation substring match (existing)
-            elif not verify_citation(raw_chunk, triplet.citation_quote):
+            if reason is None and not verify_citation(raw_chunk, triplet.citation_quote):
                 reason = "citation_mismatch"
 
             # Layer 4: citation quality score
-            elif score < CITATION_SCORE_THRESHOLD:
+            if reason is None and score < CITATION_SCORE_THRESHOLD:
                 reason = "low_citation_score"
 
             # Layer 5: atomicity — no compound conjunctions
-            elif any(c in (triplet.citation_quote or "").lower() for c in COMPOUND_CONJUNCTIONS):
+            if reason is None and any(c in (triplet.citation_quote or "").lower() for c in COMPOUND_CONJUNCTIONS):
                 reason = "compound_fact"
 
             if reason is not None:

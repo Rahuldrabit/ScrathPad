@@ -199,7 +199,13 @@ class GraphTriplet(BaseModel):
         ),
     )
     source_type: EntityType = Field(
-        ..., description="Type of source_entity. MUST be one of the EntityType literals."
+        ..., 
+        description=(
+            "Type of source_entity. MUST be one of the EntityType literals. "
+            "CRITICAL: If FILE, entity MUST have a file extension (e.g. config.json). "
+            "Do NOT use FILE for components/libraries (use SERVICE). "
+            "If PROTOCOL, entity MUST be a standard protocol like http, tcp, etc."
+        )
     )
     source_entity: str = Field(
         ...,
@@ -227,7 +233,13 @@ class GraphTriplet(BaseModel):
         ),
     )
     target_type: EntityType = Field(
-        ..., description="Type of target_entity. MUST be one of the EntityType literals."
+        ..., 
+        description=(
+            "Type of target_entity. MUST be one of the EntityType literals. "
+            "CRITICAL: If FILE, entity MUST have a file extension (e.g. config.json). "
+            "Do NOT use FILE for components/libraries (use SERVICE). "
+            "If PROTOCOL, entity MUST be a standard protocol like http, tcp, etc."
+        )
     )
     target_entity: str = Field(
         ...,
