@@ -63,8 +63,20 @@ class ScratchpadMiddleware:
         with a stale, unchanged context after a real failure.
         """
         system_prompt = (
-            "Extract clear entity-relationship triplets from the messy, "
-            "unstructured text."
+            "Extract Knowledge Graph triplets from the unstructured text.\n\n"
+            "CRITICAL FORMAT RULES:\n"
+            "1. direction_check: exactly [SUBJECT] -> [verb] -> [OBJECT]. "
+            "Example: [AUTH_SERVICE] -> [connects_to] -> [DATABASE]\n"
+            "2. Entities: SHORT UPPER_SNAKE_CASE (e.g. AUTH_SERVICE).\n"
+            "3. relationship must be one of: "
+            "imports, calls, uses, reads, writes, inserts_into, selects_from, "
+            "updates, deletes_from, depends_on, extends, implements, configures, "
+            "connects_to, validates, retries, publishes_to, subscribes_to, awaits, "
+            "emits, listens_to, pushes_to, polls, schedules, spawns, owns, contains, "
+            "runs_on_port, has_primary_ip, hosted_in_region.\n"
+            "4. citation_quote must be a VERBATIM substring of the input.\n"
+            "5. source_type/target_type: SERVICE, FILE, TABLE, CONFIG_KEY, "
+            "FUNCTION, QUEUE, PROTOCOL, ENV_VAR, CACHE, or DATABASE."
         )
         extracted_payload: L1ExtractionPayload = self.inference_engine.generate_structured(
             prompt=raw_text,

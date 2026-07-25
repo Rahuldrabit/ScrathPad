@@ -72,7 +72,6 @@ def validate_entity_shape(entity: str, entity_type: str) -> bool:
     return bool(pattern.match((entity or "").strip()))
 
 
-# ─────────────────────────────────────────────────────────────────────────
 # Closed relationship vocabulary
 # Must include BOTH the base set AND the functional subset (Layer 6),
 # otherwise the contradiction guardrail is dead code.
@@ -91,6 +90,17 @@ ALLOWED_RELATIONSHIPS = frozenset({
     # scratchpad-internal
     "has_plan", "involves", "calls_tool", "resolved_by", "blocks",
 })
+
+RelationshipType = Literal[
+    "imports", "calls", "uses", "reads", "writes", "inserts_into",
+    "selects_from", "updates", "deletes_from", "depends_on",
+    "extends", "implements", "configures",
+    "connects_to", "validates", "retries", "publishes_to",
+    "subscribes_to", "awaits", "emits", "listens_to", "pushes_to",
+    "polls", "schedules", "spawns", "owns", "contains",
+    "runs_on_port", "has_primary_ip", "hosted_in_region",
+    "has_plan", "involves", "calls_tool", "resolved_by", "blocks"
+]
 
 
 # Layer 6's contradiction guard only fires for relations where two
@@ -203,12 +213,17 @@ class GraphTriplet(BaseModel):
             "than putting the value in an entity field."
         ),
     )
-    relationship: str = Field(
+    relationship: RelationshipType = Field(
         ...,
         description=(
-            "Active verb indicating connection (lowercase_with_underscores). "
-            "MUST be in ALLOWED_RELATIONSHIPS — the verification gate "
-            "will reject any other value."
+            "Active verb (lowercase_with_underscores). MUST be one of: "
+            "imports, calls, uses, reads, writes, inserts_into, selects_from, "
+            "updates, deletes_from, depends_on, extends, implements, configures, "
+            "connects_to, validates, retries, publishes_to, subscribes_to, awaits, "
+            "emits, listens_to, pushes_to, polls, schedules, spawns, owns, contains, "
+            "runs_on_port, has_primary_ip, hosted_in_region, has_plan, involves, "
+            "calls_tool, resolved_by, blocks. "
+            "Any other value will be rejected."
         ),
     )
     target_type: EntityType = Field(

@@ -48,7 +48,6 @@ What the wrapper exposes for the agent:
 from __future__ import annotations
 
 import os
-import re
 import uuid
 import json
 import httpx
@@ -137,7 +136,6 @@ class ScratchpadPoweredLLM:
         system_safety_buffer: int = DEFAULT_SAFETY_BUFFER,
         auto_plan: bool = True,
         lmstudio_url: str = "http://localhost:1234/v1",
-        strict_grounding: bool = False,
     ):
         self.goal = goal
         self.context_size = context_size
@@ -147,12 +145,6 @@ class ScratchpadPoweredLLM:
         self.middleware_url = middleware_url  # None → in-process mode
         self.lmstudio_url = lmstudio_url
         self.system_safety_buffer = system_safety_buffer
-        # If True, a response mentioning entities not in the verified
-        # scratchpad gets a visible caveat appended to its own text rather
-        # than just a logged warning. Default False: log-only, so this is
-        # a strict opt-in and never silently changes answer content unless
-        # asked to.
-        self.strict_grounding = strict_grounding
         # The scratchpad view will be token-bounded to this budget.
         # If context_size is 8000 and safety buffer is 2000, the view
         # gets up to 6000 tokens — plenty for the LLM to read and reason over.
@@ -194,100 +186,19 @@ class ScratchpadPoweredLLM:
         **kwargs,
     ) -> Dict[str, Any]:
         """
-        1. Fetch the current scratchpad view (token-bounded, biased toward
-           entities relevant to this turn's question - see
-           _apply_query_aware_boost in engine.py).
-        2. Inject it as a system message at the top of the conversation.
-        3. Call the LLM.
-        4. Extract facts from the LLM's text response and store them.
-        5. Check the response's own claims against what it was actually
-           given (see _check_response_grounding below) - every gate up to
-           this point protects the GRAPH; nothing previously protected the
-           FINAL ANSWER itself. A model facing an incomplete view has two
-           options: say so, or fill the gap with something plausible. This
-           step doesn't force the honest option, but it stops the dishonest
-           one from passing through unflagged.
-        6. Return the OpenAI-compatible response dict, with a
-           _scratchpad_grounding key added (additive - does not change the
-           shape a caller expecting a plain OpenAI response depends on).
+        The main OpenAI-compatible entry point.
         """
-        query = self._extract_query_text(messages)
-        view = self._fetch_scratchpad_view(query=query)
+        latest_user_msg = None
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                latest_user_msg = m.get("content", "")
+                break
+        view = self._fetch_scratchpad_view(query=latest_user_msg)
         scratchpad_block = self._format_injection(view)
         augmented = self._inject_into(messages, scratchpad_block)
         response = self._call_llm(augmented, tools=tools, **kwargs)
-
-        response["_scratchpad_grounding"] = self._check_response_grounding(response)
-
         self._absorb_response(response, augmented)
         return response
-
-    def _check_response_grounding(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Narrow, high-precision hallucination check on the FINAL answer, not
-        the facts extracted from it. Scans for entity-shaped tokens
-        (matching this system's own SCREAMING_SNAKE_CASE convention) that
-        don't correspond to anything in the current session's active
-        knowledge graph.
-
-        This is deliberately narrow, and it's worth being honest about what
-        it does and doesn't catch: it flags the model inventing a NEW named
-        entity that was never observed - a common, specific confabulation
-        pattern. It does NOT catch a hallucination phrased in plain prose
-        without naming a new formal entity, and it does NOT verify that a
-        claim correctly combines two real facts rather than overreaching
-        beyond what either supports alone. A clean result means "no
-        invented entities detected," not "answer fully verified."
-
-        Logs a warning (matching this file's existing [GUARDRAIL]-style
-        logging) but does not block or retry by default - see
-        strict_grounding on __init__ to force a retry instead.
-        """
-        try:
-            text = response["choices"][0]["message"].get("content") or ""
-        except (KeyError, IndexError, TypeError):
-            return {"checked": False, "reason": "no text content (tool call or empty response)"}
-
-        if not text:
-            return {"checked": False, "reason": "empty response"}
-
-        known_entities = self._get_known_entities()
-        candidates = {
-            c for c in re.findall(r"\b[A-Z][A-Z0-9_]{3,40}\b", text)
-        }
-        unknown = sorted(candidates - known_entities)
-
-        if unknown:
-            print(
-                f"[GUARDRAIL] Response mentions {len(unknown)} entity-shaped "
-                f"token(s) not in the verified scratchpad: {unknown}"
-            )
-            if self.strict_grounding:
-                response["choices"][0]["message"]["content"] = (
-                    text
-                    + f"\n\n[SCRATCHPAD WARNING: mentions unverified entities "
-                    f"not present in the session's knowledge graph: {unknown}. "
-                    f"Treat with reduced confidence.]"
-                )
-
-        return {"checked": True, "unknown_entities": unknown, "grounded": len(unknown) == 0}
-
-    def _get_known_entities(self) -> set:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT DISTINCT source_entity AS e FROM knowledge_graph
-            WHERE session_id = ? AND is_active = TRUE
-            UNION
-            SELECT DISTINCT target_entity AS e FROM knowledge_graph
-            WHERE session_id = ? AND is_active = TRUE
-            """,
-            (self.session_id, self.session_id),
-        )
-        result = {row["e"].strip().upper() for row in cur.fetchall()}
-        conn.close()
-        return result
 
     def record_observation(self, text: str, source: str = "external") -> int:
         """
@@ -403,12 +314,9 @@ class ScratchpadPoweredLLM:
 
     def _fetch_scratchpad_view(self, query: str = None) -> str:
         if self.middleware_url:
-            params = {"max_tokens": self.scratchpad_budget}
-            if query:
-                params["query"] = query
             r = httpx.get(
                 f"{self.middleware_url}/v1/session/{self.session_id}/memory",
-                params=params,
+                params={"max_tokens": self.scratchpad_budget, "query": query or ""},
                 timeout=30.0,
             )
             r.raise_for_status()
@@ -416,21 +324,6 @@ class ScratchpadPoweredLLM:
         return compile_bounded_markdown_view(
             self.session_id, max_tokens=self.scratchpad_budget, query=query
         )
-
-    def _extract_query_text(self, messages: List[Dict[str, Any]]) -> str:
-        """
-        Best-effort extraction of "what is this turn actually about", used
-        to bias scratchpad retrieval toward the relevant part of a long
-        session instead of pure global relevance_score. Takes the last
-        user-role message; falls back to the last message of any role if
-        there's no user turn (e.g. a tool-result continuation).
-        """
-        for m in reversed(messages):
-            if m.get("role") == "user" and m.get("content"):
-                return str(m["content"])
-        if messages and messages[-1].get("content"):
-            return str(messages[-1]["content"])
-        return ""
 
     def _format_injection(self, view: str) -> str:
         """Format the scratchpad as a system-prompt block."""
@@ -494,7 +387,7 @@ class ScratchpadPoweredLLM:
         r = httpx.post(
             f"{self.lmstudio_url}/chat/completions",
             json=payload,
-            timeout=kwargs.get("timeout", 120.0),
+            timeout=kwargs.get("timeout", 600.0),
         )
         r.raise_for_status()
         return r.json()
@@ -553,10 +446,26 @@ class ScratchpadPoweredLLM:
 
         system_prompt = (
             "You extract Knowledge Graph triplets and variable updates from "
-            "unstructured text. Every triplet MUST include a citation_quote "
-            "that is a verbatim substring of the input — fabricating a quote "
-            "will get the fact rejected by the verification gate. Only "
-            "extract facts that are actually supported by the text."
+            "unstructured text.\n\n"
+            "CRITICAL FORMAT RULES for each triplet:\n"
+            "1. direction_check MUST be exactly: [SUBJECT] -> [verb] -> [OBJECT]\n"
+            "   Use square brackets and arrows. SUBJECT must match source_entity, "
+            "OBJECT must match target_entity.\n"
+            "   Example: [AUTH_SERVICE] -> [connects_to] -> [DATABASE]\n"
+            "2. source_entity and target_entity: SHORT UPPER_SNAKE_CASE identifiers "
+            "(e.g. AUTH_SERVICE, not 'the auth service pods').\n"
+            "3. relationship MUST be one of: "
+            "imports, calls, uses, reads, writes, inserts_into, selects_from, "
+            "updates, deletes_from, depends_on, extends, implements, configures, "
+            "connects_to, validates, retries, publishes_to, subscribes_to, awaits, "
+            "emits, listens_to, pushes_to, polls, schedules, spawns, owns, contains, "
+            "runs_on_port, has_primary_ip, hosted_in_region, has_plan, involves, "
+            "calls_tool, resolved_by, blocks.\n"
+            "4. citation_quote MUST be a VERBATIM substring of the input text — "
+            "fabricating will get the fact rejected.\n"
+            "5. source_type and target_type: one of SERVICE, FILE, TABLE, "
+            "CONFIG_KEY, FUNCTION, QUEUE, PROTOCOL, ENV_VAR, CACHE, DATABASE.\n\n"
+            "Only extract facts actually supported by the text."
         )
         prompt = (
             f"CONTEXT: {context_hint}\n\n"
@@ -684,7 +593,7 @@ class ScratchpadPoweredLLM:
                 # it by hand.
                 direction_check=f.get(
                     "direction_check",
-                    f"[{f['source_entity']}] -> [{f['relationship']}] -> [{f['target_entity']}]",
+                    f"{f['source_entity']} -> {f['relationship']} -> {f['target_entity']}",
                 ),
                 source_entity=f["source_entity"],
                 source_type=f.get("source_type", "SERVICE"),

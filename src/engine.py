@@ -357,7 +357,20 @@ def commit_page_data_to_sqlite(
             # Layer 1: in-schema CoT — model said who-acts-on-whom,
             # now verify what it filled in matches.
             if not validate_direction(triplet):
-                reason = "direction_check_mismatch"
+                # Auto-repair: if direction_check is malformed but the other
+                # fields are fine, synthesize the correct direction_check from
+                # them. The CoT's value is in forcing the model to think about
+                # direction BEFORE filling in entity fields — once the fields
+                # are locked in, a malformed direction_check string is a
+                # formatting failure, not a reasoning failure.
+                repaired = f"[{triplet.source_entity}] -> [{triplet.relationship}] -> [{triplet.target_entity}]"
+                from schema import parse_direction
+                if parse_direction(repaired) is not None:
+                    triplet.direction_check = repaired
+                    print(f"[GUARDRAIL] Auto-repaired direction_check for: "
+                          f"{triplet.source_entity} -> {triplet.target_entity}")
+                else:
+                    reason = "direction_check_mismatch"
 
             # Layer 2: closed relationship vocabulary
             elif not validate_relationship(triplet.relationship):

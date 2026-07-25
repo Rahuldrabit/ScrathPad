@@ -64,7 +64,19 @@ class GraphSweeperDaemon:
 
     def compress_louvain_community(self, community_id, edge_ids, raw_triplets):
         markdown_triplets = "\n".join([f"* {t['source_entity']} -> {t['relationship']} -> {t['target_entity']} (citation: {t['citation_quote']})" for t in raw_triplets])
-        system_instruction = "Collapse these granular L1 triplets into a dense macro L2 summary."
+        system_instruction = (
+            "Collapse these granular L1 triplets into a dense macro L2 summary.\n\n"
+            "CRITICAL FORMAT RULES for each output triplet:\n"
+            "1. direction_check MUST be exactly: [SUBJECT] -> [verb] -> [OBJECT]\n"
+            "2. source_entity and target_entity MUST be one of the entities present "
+            "in the input community.\n"
+            "3. relationship MUST be one of the allowed verbs: "
+            "imports, calls, uses, reads, writes, inserts_into, selects_from, "
+            "updates, deletes_from, depends_on, extends, implements, configures, "
+            "connects_to, validates, retries, publishes_to, subscribes_to, awaits, "
+            "emits, listens_to, pushes_to, polls, schedules, spawns, owns, contains, "
+            "runs_on_port, has_primary_ip, hosted_in_region."
+        )
         prompt_content = f"Target Community Subgraph:\n{markdown_triplets}"
         
         structured_payload: L2CompressionPayload = self.engine.generate_structured(

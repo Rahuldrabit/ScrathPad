@@ -1,7 +1,7 @@
 import sqlite3
 import os
 
-DB_PATH = "scratchpad_memory.db"
+DB_PATH = os.getenv("SCRATCHPAD_DB_PATH", "scratchpad_memory.db")
 
 def get_db_connection():
     """Initializes a connection with WAL mode for high concurrency."""
