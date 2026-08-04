@@ -356,15 +356,17 @@ def commit_page_data_to_sqlite(
 
             # Layer 1: in-schema CoT — model said who-acts-on-whom,
             # now verify what it filled in matches.
+            #
+            # NOTE: an earlier version of this check "auto-repaired" a
+            # failed direction_check by reconstructing it from
+            # source_entity/relationship/target_entity - the exact fields
+            # it exists to independently verify against. That
+            # reconstruction always parses successfully by construction,
+            # so it always passed, silently defeating the check for every
+            # triplet that reached it. Removed. A real mismatch is a real
+            # mismatch, same as every other guardrail in this function.
             if not validate_direction(triplet):
-                repaired = f"[{triplet.source_entity}] -> [{triplet.relationship}] -> [{triplet.target_entity}]"
-                from schema import parse_direction
-                if parse_direction(repaired) is not None:
-                    triplet.direction_check = repaired
-                    print(f"[GUARDRAIL] Auto-repaired direction_check for: "
-                          f"{triplet.source_entity} -> {triplet.target_entity}")
-                else:
-                    reason = "direction_check_mismatch"
+                reason = "direction_check_mismatch"
 
             # Layer 2: closed relationship vocabulary
             if reason is None and not validate_relationship(triplet.relationship):
@@ -402,7 +404,11 @@ def commit_page_data_to_sqlite(
 
             if reason is not None:
                 _log_rejection(cursor, session_id, triplet, reason, raw_chunk, score=score)
-                extra = f" | direction_check={triplet.direction_check!r}" if reason == "direction_check_mismatch" else ""
+                if reason == "direction_check_mismatch":
+                    dc = triplet.direction_check
+                    extra = f" | stated=[{dc.stated_subject}]->[{dc.stated_verb}]->[{dc.stated_object}]"
+                else:
+                    extra = ""
                 print(f"[GUARDRAIL] Rejected: {triplet.source_entity} -> {triplet.target_entity} | {reason}{extra}")
                 continue
 

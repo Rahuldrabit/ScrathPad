@@ -119,23 +119,41 @@ def validate_relationship(rel: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Direction check regex + validator
+# Direction check: structural, not string-parsed
 # ─────────────────────────────────────────────────────────────────────────
-# Field order matters: this regex parses the direction_check string the
-# model emits. It MUST match the pattern documented in direction_check's
-# description, so the model's grammar-constrained output can't drift.
-_DIRECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*->\s*\[([^\]]+)\]\s*->\s*\[([^\]]+)\]\.?\s*$")
-
-
-def parse_direction(direction_check: str):
-    """Parse a direction_check string. Returns (subject, verb, object) or None."""
-    m = _DIRECTION_RE.match(direction_check or "")
-    if not m:
-        return None
-    return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-
+# Previously a single free-text field the model was asked to fill in the
+# form "[Subject] -> [Verb] -> [Object]", parsed with a regex. Real logs
+# showed the model frequently ignoring that convention entirely - values
+# like 'rolled out', 'Root cause identified.' with no brackets, no arrows,
+# just narrative prose. A str-typed field only constrains the grammar to
+# "any valid JSON string"; the bracket format was a description-only
+# request the decoder had no way to enforce, and the model treated it as
+# optional rather than required.
+#
+# Three separate required fields close that gap using the SAME mechanism
+# that already guarantees the rest of the schema's structure (object with
+# required string properties), rather than a regex pattern constraint
+# whose support varies significantly across JSON-schema-to-grammar
+# backends.
 
 from text_matching import fuzzy_equal
+
+
+class DirectionCheck(BaseModel):
+    """
+    In-schema chain-of-thought for direction, as three fields instead of
+    one string requiring a specific bracket format. Still generated
+    before source_entity/relationship/target_entity (see GraphTriplet
+    field order below) - the CoT-forcing property is unchanged, only the
+    parsing fragility is removed.
+    """
+    stated_subject: str = Field(
+        ..., description="Who performs the action. Must name the same entity as source_entity below."
+    )
+    stated_verb: str = Field(..., description="The action or relationship being described.")
+    stated_object: str = Field(
+        ..., description="Who or what is acted upon. Must name the same entity as target_entity below."
+    )
 
 
 def validate_direction(t: "GraphTriplet") -> bool:
@@ -145,23 +163,18 @@ def validate_direction(t: "GraphTriplet") -> bool:
     where the LLM 'thought' one direction but emitted the opposite.
 
     Uses fuzzy matching rather than exact equality. direction_check and
-    source_entity/target_entity are two independently-generated fields
-    filled in by the same model within one response, and in practice they
-    drift in phrasing even when the model got the direction genuinely
-    right - "AUTH_SERVICE pods" in one field vs "AUTH_SERVICE" in the
-    other is not a direction error, it's the same entity described two
-    ways. A genuine subject/object swap still fails this check: swapped
-    entities are not fuzzy-similar to each other unless they happen to
-    share very similar names, which a real swap error essentially never
-    does.
+    source_entity/target_entity are independently-generated fields filled
+    in by the same model within one response, and in practice they drift
+    in phrasing even when the model got the direction genuinely right -
+    "AUTH_SERVICE pods" in one field vs "AUTH_SERVICE" in the other is not
+    a direction error, it's the same entity described two ways. A genuine
+    subject/object swap still fails this check: swapped entities are not
+    fuzzy-similar to each other unless they happen to share very similar
+    names, which a real swap error essentially never does.
     """
-    parsed = parse_direction(t.direction_check)
-    if parsed is None:
-        return False
-    subj, _verb, obj = parsed
     return (
-        fuzzy_equal(subj, t.source_entity)
-        and fuzzy_equal(obj, t.target_entity)
+        fuzzy_equal(t.direction_check.stated_subject, t.source_entity)
+        and fuzzy_equal(t.direction_check.stated_object, t.target_entity)
     )
 
 
@@ -188,14 +201,13 @@ class GraphTriplet(BaseModel):
     this is the second line of defense in case the model skipped the
     grammar-constrained reasoning.
     """
-    direction_check: str = Field(
+    direction_check: DirectionCheck = Field(
         ...,
         description=(
-            "ONE LINE in exactly the form: [Subject] -> [Verb] -> [Object]. "
-            "State who acts on whom BEFORE filling the fields below. Name "
-            "the SAME entities here that you will write in source_entity "
-            "and target_entity - use identical short names in both places. "
-            "Example: [ORDER_SERVICE] -> [calls] -> [PAYMENT_GATEWAY]."
+            "State who acts on whom BEFORE filling the fields below. "
+            "stated_subject and stated_object must name the SAME entities "
+            "you write in source_entity and target_entity - identical "
+            "short names in both places."
         ),
     )
     source_type: EntityType = Field(

@@ -48,6 +48,7 @@ What the wrapper exposes for the agent:
 from __future__ import annotations
 
 import os
+import re
 import uuid
 import json
 import httpx
@@ -56,7 +57,7 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 from inference import UniversalInferenceEngine
-from schema import GraphTriplet, PageExtractionPayload
+from schema import GraphTriplet, DirectionCheck, PageExtractionPayload
 from engine import compile_bounded_markdown_view, commit_page_data_to_sqlite
 from database import initialize_database, get_db_connection
 
@@ -136,6 +137,7 @@ class ScratchpadPoweredLLM:
         system_safety_buffer: int = DEFAULT_SAFETY_BUFFER,
         auto_plan: bool = True,
         lmstudio_url: str = "http://localhost:1234/v1",
+        strict_grounding: bool = False,
     ):
         self.goal = goal
         self.context_size = context_size
@@ -145,6 +147,11 @@ class ScratchpadPoweredLLM:
         self.middleware_url = middleware_url  # None → in-process mode
         self.lmstudio_url = lmstudio_url
         self.system_safety_buffer = system_safety_buffer
+        # If True, a response mentioning entities not in the verified
+        # scratchpad gets a visible caveat appended to its own text rather
+        # than just a logged warning. Default False: log-only, never
+        # silently changes answer content unless asked to.
+        self.strict_grounding = strict_grounding
         # The scratchpad view will be token-bounded to this budget.
         # If context_size is 8000 and safety buffer is 2000, the view
         # gets up to 6000 tokens — plenty for the LLM to read and reason over.
@@ -187,6 +194,14 @@ class ScratchpadPoweredLLM:
     ) -> Dict[str, Any]:
         """
         The main OpenAI-compatible entry point.
+
+        Every verification gate up to this point (citation match,
+        canonicalization, direction check, relationship vocabulary)
+        protects the GRAPH - what gets stored. Nothing previously checked
+        the FINAL ANSWER itself. A model facing an incomplete view has two
+        options: say so, or fill the gap with something plausible. This
+        doesn't force the honest option, but it stops the dishonest one
+        from passing through unflagged - see _check_response_grounding.
         """
         latest_user_msg = None
         for m in reversed(messages):
@@ -197,8 +212,75 @@ class ScratchpadPoweredLLM:
         scratchpad_block = self._format_injection(view)
         augmented = self._inject_into(messages, scratchpad_block)
         response = self._call_llm(augmented, tools=tools, **kwargs)
+
+        response["_scratchpad_grounding"] = self._check_response_grounding(response)
+
         self._absorb_response(response, augmented)
         return response
+
+    def _check_response_grounding(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Narrow, high-precision hallucination check on the FINAL answer, not
+        the facts extracted from it. Scans for entity-shaped tokens
+        (matching this system's own SCREAMING_SNAKE_CASE convention) that
+        don't correspond to anything in the current session's active
+        knowledge graph.
+
+        Deliberately narrow, worth being honest about: this flags the
+        model inventing a NEW named entity that was never observed - a
+        common, specific confabulation pattern. It does NOT catch a
+        hallucination phrased in plain prose without naming a new formal
+        entity, and it does NOT verify that a claim correctly combines two
+        real facts rather than overreaching beyond what either supports.
+        A clean result means "no invented entities detected," not "answer
+        fully verified."
+
+        Logs a warning by default; set strict_grounding=True on __init__
+        to also append a visible caveat to the answer text.
+        """
+        try:
+            text = response["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            return {"checked": False, "reason": "no text content (tool call or empty response)"}
+
+        if not text:
+            return {"checked": False, "reason": "empty response"}
+
+        known_entities = self._get_known_entities()
+        candidates = set(re.findall(r"\b[A-Z][A-Z0-9_]{3,40}\b", text))
+        unknown = sorted(candidates - known_entities)
+
+        if unknown:
+            print(
+                f"[GUARDRAIL] Response mentions {len(unknown)} entity-shaped "
+                f"token(s) not in the verified scratchpad: {unknown}"
+            )
+            if self.strict_grounding:
+                response["choices"][0]["message"]["content"] = (
+                    text
+                    + f"\n\n[SCRATCHPAD WARNING: mentions unverified entities "
+                    f"not present in the session's knowledge graph: {unknown}. "
+                    f"Treat with reduced confidence.]"
+                )
+
+        return {"checked": True, "unknown_entities": unknown, "grounded": len(unknown) == 0}
+
+    def _get_known_entities(self) -> set:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT source_entity AS e FROM knowledge_graph
+            WHERE session_id = ? AND is_active = TRUE
+            UNION
+            SELECT DISTINCT target_entity AS e FROM knowledge_graph
+            WHERE session_id = ? AND is_active = TRUE
+            """,
+            (self.session_id, self.session_id),
+        )
+        result = {row["e"].strip().upper() for row in cur.fetchall()}
+        conn.close()
+        return result
 
     def record_observation(self, text: str, source: str = "external") -> int:
         """
@@ -448,12 +530,18 @@ class ScratchpadPoweredLLM:
             "You extract Knowledge Graph triplets and variable updates from "
             "unstructured text.\n\n"
             "CRITICAL FORMAT RULES for each triplet:\n"
-            "1. direction_check MUST be exactly: [SUBJECT] -> [verb] -> [OBJECT]\n"
-            "   Use square brackets and arrows. SUBJECT must match source_entity, "
-            "OBJECT must match target_entity.\n"
-            "   Example: [AUTH_SERVICE] -> [connects_to] -> [DATABASE]\n"
+            "1. direction_check is an object with three fields: "
+            "stated_subject, stated_verb, stated_object.\n"
+            "   stated_subject MUST match source_entity, stated_object MUST "
+            "match target_entity - name the same entity the same way in "
+            "both places.\n"
+            "   Example: {\"stated_subject\": \"AUTH_SERVICE\", \"stated_verb\": "
+            "\"connects_to\", \"stated_object\": \"DATABASE\"}\n"
             "2. source_entity and target_entity: SHORT UPPER_SNAKE_CASE identifiers "
-            "(e.g. AUTH_SERVICE, not 'the auth service pods').\n"
+            "(e.g. AUTH_SERVICE, not 'the auth service pods'). If the fact is "
+            "really about a metric, count, or timestamp rather than a second "
+            "named entity, skip the triplet rather than forcing a value into "
+            "an entity field.\n"
             "3. relationship MUST be one of: "
             "imports, calls, uses, reads, writes, inserts_into, selects_from, "
             "updates, deletes_from, depends_on, extends, implements, configures, "
@@ -584,16 +672,20 @@ class ScratchpadPoweredLLM:
             return 0
         triplets = [
             GraphTriplet(
-                # LLM-extracted facts (via _extract_facts) already carry
-                # these, generated under grammar constraint - use them.
-                # Internal/deterministic facts (tool-call bookkeeping, plan
-                # entities) don't need an SLM to reason about direction;
-                # Python already knows it with certainty, so derive it
-                # rather than requiring every internal call site to supply
-                # it by hand.
+                # LLM-extracted facts (via _extract_facts) already carry a
+                # DirectionCheck object, generated under grammar constraint
+                # - use it directly. Internal/deterministic facts
+                # (tool-call bookkeeping, plan entities) don't need an SLM
+                # to reason about direction; Python already knows it with
+                # certainty, so construct it directly rather than
+                # requiring every internal call site to supply one by hand.
                 direction_check=f.get(
                     "direction_check",
-                    f"{f['source_entity']} -> {f['relationship']} -> {f['target_entity']}",
+                    DirectionCheck(
+                        stated_subject=f["source_entity"],
+                        stated_verb=f["relationship"],
+                        stated_object=f["target_entity"],
+                    ),
                 ),
                 source_entity=f["source_entity"],
                 source_type=f.get("source_type", "SERVICE"),
