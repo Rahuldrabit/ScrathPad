@@ -87,7 +87,7 @@ def run_without_scratchpad(document: str, question: str, token_budget: int,
         "temperature": 0.1,
         "max_tokens": 500,
     }
-    r = httpx.post(f"{llm_url}/chat/completions", json=payload, timeout=120.0)
+    r = httpx.post(f"{llm_url}/chat/completions", json=payload, timeout=600.0)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 

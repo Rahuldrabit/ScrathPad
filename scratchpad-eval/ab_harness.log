@@ -1,0 +1,36 @@
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Auto-repaired target_type for: HTTPX (PROTOCOL -> SERVICE)
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: BILLING_SERVICE -> PAYMENT_SERVICE | direction_check_mismatch | stated=[BILLING_SERVICE]->[connects_to]->[SESSION_MIDDLEWARE]
+[GUARDRAIL] Auto-repaired source_type for: SESSION-MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: SESSION-MIDDLEWARE -> AUTH-SERVICE | bad_source_entity_shape
+[GUARDRAIL] Rejected: PAYMENT_SERVICE -> N/A | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[342 transactions in the last hour]
+[GUARDRAIL] Rejected: PAYMENT_SERVICE -> N/A | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[45ms (nominal, unaffected)]
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: BILLING_SERVICE -> PAYMENT_SERVICE | direction_check_mismatch | stated=[BILLING_SERVICE]->[connects_to]->[SESSION_MIDDLEWARE]
+[GUARDRAIL] Auto-repaired source_type for: SESSION-MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: SESSION-MIDDLEWARE -> AUTH-SERVICE | bad_source_entity_shape
+[GUARDRAIL] Rejected: PAYMENT_SERVICE -> N/A | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[342 transactions in the last hour]
+[GUARDRAIL] Rejected: PAYMENT_SERVICE -> N/A | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[45ms (nominal, unaffected)]
+[GUARDRAIL] Rejected: BILLING_SERVICE -> N/A | direction_check_mismatch | stated=[BILLING_SERVICE]->[schedules]->[job queued for 22:00]
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: BILLING_SERVICE -> PAYMENT_SERVICE | direction_check_mismatch | stated=[BILLING_SERVICE]->[connects_to]->[SESSION_MIDDLEWARE]
+[GUARDRAIL] Auto-repaired source_type for: SESSION-MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: SESSION-MIDDLEWARE -> AUTH-SERVICE | bad_source_entity_shape
+[GUARDRAIL] Rejected: PAYMENT_SERVICE -> N/A | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[342 transactions in the last hour]
+[GUARDRAIL] Rejected: PAYMENT_SERVICE -> N/A | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[45ms (nominal, unaffected)]
+[GUARDRAIL] Rejected: BILLING_SERVICE -> N/A | direction_check_mismatch | stated=[BILLING_SERVICE]->[schedules]->[job queued for 22:00]
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: BILLING_SERVICE -> PAYMENT_SERVICE | direction_check_mismatch | stated=[BILLING_SERVICE]->[connects_to]->[SESSION_MIDDLEWARE]
+[GUARDRAIL] Auto-repaired source_type for: SESSION-MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: SESSION-MIDDLEWARE -> AUTH-SERVICE | bad_source_entity_shape
+[GUARDRAIL] Rejected: PAYMENT_SERVICE ->  | direction_check_mismatch | stated=[PAYMENT_SERVICE]->[has_plan]->[342 transactions in the last hour]
+[GUARDRAIL] Auto-repaired source_type for: SESSION_MIDDLEWARE (FILE -> SERVICE)
+[GUARDRAIL] Rejected: BILLING_SERVICE -> PAYMENT_SERVICE | direction_check_mismatch | stated=[BILLING_SERVICE]->[connects_to]->[SESSION_MIDDLEWARE]
+[GUARDRAIL] Response mentions 1 entity-shaped token(s) not in the verified scratchpad: ['AUTH']
+condition            pass_rate    avg_completeness   hallucination_free_rate 
+without_scratchpad   0%           40%                100%                    
+with_scratchpad      0%           84%                100%                    
