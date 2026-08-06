@@ -1,6 +1,7 @@
 import uuid
 import asyncio
 import yaml
+import re
 from pathlib import Path
 from database import get_db_connection
 from schema import (
@@ -585,6 +586,12 @@ def compile_bounded_markdown_view(
         (session_id,),
     )
     var_rows = cursor.fetchall()
+    
+    # Fetch user_query to use as the title/filename
+    cursor.execute("SELECT user_query FROM sessions WHERE session_id = ?", (session_id,))
+    session_row = cursor.fetchone()
+    title = session_row["user_query"] if session_row and session_row["user_query"] else session_id
+    
     conn.close()
 
     # --- Section 1: Unresolved Variables (fixed priority, never cut) ---
@@ -640,5 +647,22 @@ def compile_bounded_markdown_view(
             f"budget. Call drill-down on a COMPRESSED node, or raise max_tokens, to see more.)*"
         )
     graph_section = "\n".join(graph_lines)
+    
+    final_markdown = f"{var_section}\n\n{graph_section}"
+    
+    # Save the generated markdown file to a scratchpad folder based on its title
+    safe_title = re.sub(r'[^a-zA-Z0-9_\-]', '_', title)
+    safe_title = safe_title[:100].strip('_')
+    if not safe_title:
+        safe_title = session_id
+    
+    out_dir = Path("scratchpad")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / f"{safe_title}.md"
+    
+    try:
+        out_file.write_text(final_markdown, encoding="utf-8")
+    except Exception as e:
+        print(f"[engine] Failed to save scratchpad markdown to {out_file}: {e}")
 
-    return f"{var_section}\n\n{graph_section}"
+    return final_markdown
