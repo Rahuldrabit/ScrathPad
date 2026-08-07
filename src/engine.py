@@ -4,6 +4,7 @@ import yaml
 import re
 from pathlib import Path
 from database import get_db_connection
+import config
 from schema import (
     PageExtractionPayload,
     ALLOWED_RELATIONSHIPS,
@@ -540,7 +541,7 @@ def _apply_query_aware_boost(rows: list, query: str, k_hops: int) -> list:
 
 def compile_bounded_markdown_view(
     session_id: str,
-    max_tokens: int = 6000,
+    max_tokens: int = config.SCRATCHPAD_DEFAULT_MAX_TOKENS,
     footer_reserve_tokens: int = 60,
     query: str = None,
     k_hops: int = 2,

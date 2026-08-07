@@ -2,7 +2,7 @@ from typing import Optional
 from inference import UniversalInferenceEngine
 from engine import commit_page_data_to_sqlite, compile_bounded_markdown_view
 from schema import PageExtractionPayload, L1ExtractionPayload
-
+import config
 
 class ScratchpadMiddleware:
     """
@@ -24,7 +24,7 @@ class ScratchpadMiddleware:
     attribute was ever read anywhere else in the class).
     """
 
-    def __init__(self, token_window: int = 8192, t_system_safety_buffer: int = 1500):
+    def __init__(self, token_window: int = config.SCRATCHPAD_CONTEXT_SIZE, t_system_safety_buffer: int = config.SCRATCHPAD_SAFETY_BUFFER):
         self.inference_engine = UniversalInferenceEngine()
         self.token_window = token_window
         self.t_system_safety_buffer = t_system_safety_buffer

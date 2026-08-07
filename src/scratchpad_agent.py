@@ -60,6 +60,7 @@ from inference import UniversalInferenceEngine
 from schema import GraphTriplet, DirectionCheck, PageExtractionPayload
 from engine import compile_bounded_markdown_view, commit_page_data_to_sqlite
 from database import initialize_database, get_db_connection
+import config
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -129,12 +130,12 @@ class ScratchpadPoweredLLM:
     def __init__(
         self,
         goal: str,
-        context_size: int = 8000,
+        context_size: int = config.SCRATCHPAD_CONTEXT_SIZE,
         session_id: Optional[str] = None,
         model: Optional[str] = None,
         backend: str = "lmstudio",
         middleware_url: Optional[str] = None,
-        system_safety_buffer: int = DEFAULT_SAFETY_BUFFER,
+        system_safety_buffer: int = config.SCRATCHPAD_SAFETY_BUFFER,
         auto_plan: bool = True,
         lmstudio_url: str = "http://localhost:1234/v1",
         strict_grounding: bool = False,

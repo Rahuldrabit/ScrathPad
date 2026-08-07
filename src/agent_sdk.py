@@ -1,4 +1,5 @@
 import httpx
+import config
 from typing import List, Dict
 
 class ScratchpadAgentClient:
@@ -8,7 +9,7 @@ class ScratchpadAgentClient:
         self.base_url = base_url
         self.client = httpx.AsyncClient(base_url=base_url)
 
-    async def get_memory_view(self, max_tokens: int = 6000) -> str:
+    async def get_memory_view(self, max_tokens: int = config.SCRATCHPAD_DEFAULT_MAX_TOKENS) -> str:
         response = await self.client.get(
             f"/v1/session/{self.session_id}/memory",
             params={"max_tokens": max_tokens},

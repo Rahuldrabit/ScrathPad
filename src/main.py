@@ -1,4 +1,5 @@
 import json
+import config
 import asyncio
 from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
@@ -52,7 +53,7 @@ async def initialize_session(payload: SessionInitRequest):
         conn.close()
 
 @app.get("/v1/session/{session_id}/memory", response_model=MemoryViewResponse)
-async def get_session_memory_view(session_id: str, max_tokens: int = 6000, query: str = None):
+async def get_session_memory_view(session_id: str, max_tokens: int = config.SCRATCHPAD_DEFAULT_MAX_TOKENS, query: str = None):
     """
     Compiles the relational data matrix out of SQLite directly into
     a token-bounded GitHub-Flavored Markdown text layer for agents to read.
