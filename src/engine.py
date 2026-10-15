@@ -507,8 +507,24 @@ def _apply_query_aware_boost(rows: list, query: str, k_hops: int) -> list:
     import networkx as nx
     from text_matching import strip_separators
 
+    # `emits`/`blocks` rows are fault EVIDENCE (anomaly/error signal); `calls`/
+    # `has_task` rows are baseline topology. Their relevance_score is not
+    # comparable: topology relevance scales with raw call volume (saturates
+    # near 1.0 for almost any real traffic), while anomaly relevance scales
+    # with a ratio-over-mean that rarely approaches 1.0. Left unweighted, a
+    # token-bounded cut fills up with high-volume topology edges and starves
+    # out the evidence an RCA decision actually needs. Evidence rows are
+    # therefore always ranked ahead of topology rows; relevance_score only
+    # orders within each tier.
+    def _evidence_tier(r):
+        return 1 if r["relationship"] in ("emits", "blocks") else 0
+
     if not query or not rows:
-        return sorted(rows, key=lambda r: r["relevance_score"] or 0.0, reverse=True)
+        return sorted(
+            rows,
+            key=lambda r: (_evidence_tier(r), r["relevance_score"] or 0.0),
+            reverse=True,
+        )
 
     G = nx.Graph()
     for r in rows:
@@ -521,7 +537,11 @@ def _apply_query_aware_boost(rows: list, query: str, k_hops: int) -> list:
     }
 
     if not mentioned:
-        return sorted(rows, key=lambda r: r["relevance_score"] or 0.0, reverse=True)
+        return sorted(
+            rows,
+            key=lambda r: (_evidence_tier(r), r["relevance_score"] or 0.0),
+            reverse=True,
+        )
 
     neighborhood = set(mentioned)
     frontier = set(mentioned)
@@ -534,7 +554,7 @@ def _apply_query_aware_boost(rows: list, query: str, k_hops: int) -> list:
 
     def sort_key(r):
         in_neighborhood = r["source_entity"] in neighborhood or r["target_entity"] in neighborhood
-        return (1 if in_neighborhood else 0, r["relevance_score"] or 0.0)
+        return (1 if in_neighborhood else 0, _evidence_tier(r), r["relevance_score"] or 0.0)
 
     return sorted(rows, key=sort_key, reverse=True)
 
